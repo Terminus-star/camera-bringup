@@ -1,0 +1,18 @@
+# pacman (ALPM) hook: after the official linux-cachyos is installed or upgraded, print a reminder
+# that the GZ302 camera kernel (linux-cachyos-camera, built from the same CachyOS release) should be
+# rebuilt. It only prints; it builds and changes nothing.
+#
+# Install (as root, your decision):   sudo install -m644 kernel/hooks/gz302-camera-kernel-notify.hook /etc/pacman.d/hooks/
+# Remove:                             sudo rm /etc/pacman.d/hooks/gz302-camera-kernel-notify.hook
+# Format: man alpm-hooks
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = linux-cachyos
+
+[Action]
+Description = GZ302 camera: new CachyOS kernel, the camera kernel needs a rebuild
+When = PostTransaction
+Exec = /usr/bin/echo "==> GZ302 camera: run  bash /home/termis/Projects/camera-bringup/scripts/rebuild-camera-kernel.sh  (as your user) to build and install the matching linux-cachyos-camera kernel."

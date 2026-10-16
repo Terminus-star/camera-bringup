@@ -1,0 +1,22 @@
+From: GZ302 camera bring-up <local>
+Subject: [PATCH] drm/amdgpu: recognize the GZ302 OV13B10 ISP sensor
+
+The ASUS ROG Flow Z13 GZ302EA exposes its rear OmniVision OV13B10 sensor as
+ACPI HID OMNI13B1.  AMDGPU currently recognizes only the reference OMNI5C10
+sensor for ISP4 setup, so it declines to create the ISP capture, I2C and GPIO
+MFD devices on this laptop.
+
+Add the GZ302 sensor HID to AMDGPU's ISP allow-list.
+
+---
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c
+@@ -1588,6 +1588,7 @@
+ #if IS_ENABLED(CONFIG_DRM_AMD_ISP)
+ static const struct acpi_device_id isp_sensor_ids[] = {
+ 	{ "OMNI5C10" },
++	{ "OMNI13B1" }, /* ASUS ROG Flow Z13 (GZ302EA), OV13B10 rear camera */
+ 	{ }
+ };
+ 
