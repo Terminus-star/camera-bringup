@@ -3,14 +3,14 @@
 #
 # For each value N in --values, it:
 #   1. unloads the stock amd_isp4_capture module (only that module; its dependencies stay loaded),
-#   2. loads our patched scratch/isp4-threshold/amd_isp4_capture.ko with min_start_bufs=N and
+#   2. loads our patched driver/amd_isp4_capture.ko with min_start_bufs=N and
 #      dynamic debug on,
 #   3. enables the ISP firmware log (debugfs),
 #   4. captures from the ISP video node for a few seconds,
 #   5. saves the kernel log of that run and prints a one-line verdict.
 # Finally it reloads the stock module.
 #
-# What the verdict lines mean (see scratch/isp4-threshold/README.md):
+# What the verdict lines mean (see driver/README.md):
 #   queued   = our "EXP: START_STREAM queued" line appeared (the driver put the command in the ring)
 #   fw-reply = the firmware answered it (a "cmd ISP4FW_CMD_ID_START_STREAM(...)" debug line)
 #   frames   = number of "poc:" lines (one per frame notification from the firmware)
@@ -46,12 +46,32 @@
 #     ./scripts/test-isp4-threshold.sh ... --start-sensor 2 --sensor-pm-cycle --phy-init
 #                                                            # also start the MIPI D-PHY receiver from the host
 #                                                            # like Windows, with the sensor powered (patch 0021)
+#     ./scripts/test-isp4-threshold.sh ... --skip-enable-gpio
+#                                                            # never drive the enable_isp GPIO (AMDI0030:00 pin
+#                                                            # 85); it stays low (patch 0023, LED investigation)
+#     ./scripts/test-isp4-threshold.sh ... --start-sensor 2 --sensor-pm-cycle --sensor-pll 2
+#                                                            # after s_stream: 1 = log the sensor PLL registers,
+#                                                            # 2 = also apply the Windows 24 MHz PLL (patch 0025)
+#     ./scripts/test-isp4-threshold.sh ... --start-sensor 1 --sensor-pll 2 --sensor-burst-ms 300
+#                                                            # safety: sensor standby 300 ms after it started
+#                                                            # streaming (patch 0026; use with --start-sensor 1)
+#     ./scripts/test-isp4-threshold.sh ... --meta-data-bufs 6
+#                                                            # send 6 type-13 META_DATA buffers (128 KiB each)
+#                                                            # before START_STREAM like Windows (patch 0027)
+#     ./scripts/test-isp4-threshold.sh ... --win-cmds 0x3f
+#                                                            # also send the Windows-only firmware commands (patch
+#                                                            # 0028): bit mask 1 RTA, 2 tuning scenario, 4 out-chan
+#                                                            # rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime,
+#                                                            # 0x40 global ENABLE_PREFETCH (patch 0029)
+#     ./scripts/test-isp4-threshold.sh ... --win-cmds 0x77 --prefetch-flags 0
+#                                                            # ENABLE_PREFETCH payload words from bits 0..2
+#                                                            # (patch 0030; default 7 = {1,1,1})
 #
 # Output goes to scratch/isp4-threshold/results/ (inside the project).
 set -u -o pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-ko="$project_dir/scratch/isp4-threshold/amd_isp4_capture.ko"
+ko="$project_dir/driver/amd_isp4_capture.ko"
 results="$project_dir/scratch/isp4-threshold/results"
 want_kver=7.2.0-1.7-cachyos
 values="4 2 1"
@@ -66,6 +86,12 @@ pool_mb=0
 start_sensor=0
 pm_cycle=0
 phy_init=0
+skip_gpio=0
+sensor_pll=0
+burst_ms=0
+meta_data_bufs=0
+win_cmds=0
+prefetch_flags=7
 
 while [[ $# -gt 0 ]]; do
 	case $1 in
@@ -81,6 +107,12 @@ while [[ $# -gt 0 ]]; do
 	--start-sensor) start_sensor=$2; shift 2 ;;
 	--sensor-pm-cycle) pm_cycle=1; shift ;;
 	--phy-init) phy_init=1; shift ;;
+	--skip-enable-gpio) skip_gpio=1; shift ;;
+	--sensor-pll) sensor_pll=$2; shift 2 ;;
+	--sensor-burst-ms) burst_ms=$2; shift 2 ;;
+	--meta-data-bufs) meta_data_bufs=$2; shift 2 ;;
+	--win-cmds) win_cmds=$2; shift 2 ;;
+	--prefetch-flags) prefetch_flags=$2; shift 2 ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -91,7 +123,9 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ -f $ko ]] || die "build the module first: ./scripts/build-isp4-threshold.sh"
 command -v v4l2-ctl >/dev/null || die "v4l2-ctl not found (package v4l-utils)"
 mkdir -p "$results"
-sudo -v || die "sudo is needed"
+# With the temporary rule of scripts/sudoers-grant-camera-tests.sh `sudo -n -l` succeeds without a password;
+# otherwise fall back to asking for the password as before.
+sudo -n -l >/dev/null 2>&1 || sudo -v || die "sudo is needed"
 
 # The ISP video node is the one whose sysfs path or name mentions "isp".  The UVC front camera
 # will not match.
@@ -146,11 +180,11 @@ for run in "${runs[@]}"; do
 	fi
 
 	cursor=$(sudo journalctl -k -n 0 --show-cursor --no-pager | sed -n 's/^-- cursor: //p')
-	sudo insmod "$ko" min_start_bufs="$n" replay_sensor_setup="$replay" sensor_prop_variant="$v" bogus_cmd="$bogus" tuning_file="$tuning" fw_mem_pool_mb="$pool_mb" start_sensor="$start_sensor" sensor_pm_cycle="$pm_cycle" phy_init="$phy_init" dyndbg=+p || die "insmod failed; see: sudo dmesg | tail -30"
+	sudo insmod "$ko" min_start_bufs="$n" replay_sensor_setup="$replay" sensor_prop_variant="$v" bogus_cmd="$bogus" tuning_file="$tuning" fw_mem_pool_mb="$pool_mb" start_sensor="$start_sensor" sensor_pm_cycle="$pm_cycle" phy_init="$phy_init" skip_enable_gpio="$skip_gpio" sensor_pll="$sensor_pll" sensor_burst_ms="$burst_ms" meta_data_bufs="$meta_data_bufs" win_cmds="$win_cmds" prefetch_flags="$prefetch_flags" dyndbg=+p || die "insmod failed; see: sudo dmesg | tail -30"
 	sleep 2
 
 	if sudo test -e /sys/kernel/debug/amd_isp4/fw_log_enable; then
-		sudo sh -c "echo 1 > /sys/kernel/debug/amd_isp4/fw_log_enable"
+		echo 1 | sudo tee /sys/kernel/debug/amd_isp4/fw_log_enable >/dev/null
 		echo "fw_log_enable = $(sudo cat /sys/kernel/debug/amd_isp4/fw_log_enable)"
 	else
 		echo "note: fw_log_enable not present; continuing without the firmware log"
@@ -190,7 +224,7 @@ for run in "${runs[@]}"; do
 	echo "--- Windows sensor setup replay (EXP-REPLAY; empty unless --replay) ---"
 	grep 'EXP-REPLAY' "$log" | sed 's/^.*amd_isp_capture amd_isp_capture: //'
 	echo "--- sensor start (EXP-SENSOR) and firmware frame events (FrameStart / FrameDone / timeouts / sensor driver errors) ---"
-	grep 'EXP-SENSOR\|EXP-PHY\|ov13b10' "$log" | sed 's/^.*kernel: //'
+	grep 'EXP-SENSOR\|EXP-PHY\|ov13b10\|skip_enable_gpio' "$log" | sed 's/^.*kernel: //'
 	echo "firmware FrameStart lines: $(grep -c 'FrameStart HWID' "$log")   FrameDone lines: $(grep -c 'FrameDone HWID' "$log")   frame-done timeouts: $(grep -c 'frame done timeout' "$log")"
 	echo "--- firmware verdict per command (EXP-RESP: status, error code, payload) ---"
 	grep 'EXP-RESP' "$log" | sed 's/^.*amd_isp_capture amd_isp_capture: //'
@@ -210,4 +244,4 @@ echo "=== summary ==="
 printf '%s\n' "${summary[@]}"
 echo
 echo "Logs and captures are in $results"
-echo "Interpretation: see scratch/isp4-threshold/README.md"
+echo "Interpretation: see driver/README.md"

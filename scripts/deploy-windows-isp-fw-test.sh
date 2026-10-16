@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prepare boot files that make the 7.2.0-1.7-cachyos camera-test kernel use a test ISP firmware
-# (built by scratch/build_winfw.py from the Windows .ram files) instead of the stock isp_4_1_1.bin.
+# (built by tools/build_winfw.py from the Windows .ram files) instead of the stock isp_4_1_1.bin.
 #
 # HOW IT WORKS (and why it is not "put the file in /usr/lib/firmware"):
 #   * amdgpu asks the kernel for "amdgpu/isp_4_1_1.bin".  The kernel looks in /lib/firmware/updates/
@@ -19,7 +19,7 @@
 #     would leak into every initramfs regenerated later.  Hence the cpio.)
 #
 # It will:
-#   1. stage the images under scratch/winfw/stage-<variant>/ and pack them into scratch/winfw/fw-<variant>.cpio
+#   1. stage the images under firmware/stage-<variant>/ and pack them into firmware/fw-<variant>.cpio
 #      (no sudo; with --build-only it stops here, so you can inspect the archives)
 #   2. for each variant create  /boot/camera-test/initramfs-fw-<variant>.img
 #                                = the cpio + /boot/camera-test/initramfs.img      (sudo)
@@ -28,7 +28,7 @@
 #      /boot/limine.conf and re-enroll the config yourself (limine-enroll-config), as for the
 #      first camera-test entry.
 #
-# Prerequisites: scripts/install-kernel-1.7-sidebyside.sh was run, scratch/winfw/ exists.
+# Prerequisites: scripts/install-kernel-1.7-sidebyside.sh was run, firmware/ exists.
 # Run from the project directory, as your normal user:
 #     ./scripts/deploy-windows-isp-fw-test.sh --build-only      # safe, no sudo, nothing outside the project
 #     ./scripts/deploy-windows-isp-fw-test.sh                   # also writes the two files under /boot
@@ -37,7 +37,7 @@
 set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-winfw="$project_dir/scratch/winfw"
+winfw="$project_dir/firmware"
 boot_dest=/boot/camera-test
 fw_rel=usr/lib/firmware/updates/amdgpu
 variants=(srx srx_h)
@@ -54,7 +54,7 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -ne 0 ]] || die "run as your normal user, not root (the script calls sudo itself)"
 command -v bsdtar >/dev/null || die "bsdtar not found (package libarchive)"
-[[ -f $winfw/SHA256SUMS ]] || die "missing $winfw/SHA256SUMS (run scratch/build_winfw.py first)"
+[[ -f $winfw/SHA256SUMS ]] || die "missing $winfw/SHA256SUMS (run tools/build_winfw.py first)"
 
 # 1. stage + pack (inside the project only)
 for v in "${variants[@]}"; do
@@ -131,7 +131,7 @@ After booting one of them (try srx_h first, then srx; do not hibernate on this k
   1. did the initramfs unpack?          journalctl -k -b -g 'unpack'      (must NOT say "unpacking failed")
   2. which firmware did amdgpu get?     journalctl -k -b -g 'isp_4_1_1'
      (the dyndbg option on the entry makes the kernel log the path and the sha256 it loaded; the
-      test image is /lib/firmware/updates/amdgpu/isp_4_1_1.bin, srx_h sha256 is in scratch/winfw/SHA256SUMS;
+      test image is /lib/firmware/updates/amdgpu/isp_4_1_1.bin, srx_h sha256 is in firmware/SHA256SUMS;
       the stock one is /lib/firmware/amdgpu/isp_4_1_1.bin.zst, sha256 f8ab7f5c...0932)
   3. run the experiment:                ./scripts/test-isp4-threshold.sh --values "4" --replay
      and look at the EXP-RESP lines: is seq 2 (SET_SENSOR_PROP) still status 1 / 0x001b?

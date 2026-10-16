@@ -1,0 +1,81 @@
+From: GZ302 camera bring-up <local>
+Subject: [PATCH] drm/amd/pm: switch ISP memory stutter / MMHUB power gating with the ISP tiles
+
+The ISP's MIPI write DMA is a real-time client.  For large images (above
+about 12 MP) the Windows camera driver switches the ISP memory path to
+"stutter on, MMHUB power gating disabled" while streaming and back when it
+stops.  The PMFW has dedicated messages for this
+(PPSMC_Message_IspStutterOn_MmhubPgDis 0x2F / ..._IspStutterOff_MmhubPgEn
+0x30), which amdgpu defines but never sends.  Without it the 13 MP OV13B
+stream on the GZ302 overflows the write DMA's latency buffer
+(INTR_LATENCY_BUFFER_LEAKING) and wedges the ISP firmware.
+
+Send the stutter-on message right after PowerUpIspByTile and the
+stutter-off message right before PowerDownIspByTile.  The argument is not
+documented; 0 is used.  A failure only logs a warning.
+
+---
+--- a/drivers/gpu/drm/amd/pm/swsmu/inc/smu_types.h
++++ b/drivers/gpu/drm/amd/pm/swsmu/inc/smu_types.h
+@@ -301,7 +301,9 @@
+ 	__SMU_DUMMY_MAP(SetSoftMaxFclk), \
+ 	__SMU_DUMMY_MAP(SetSoftMaxGl2clk), \
+ 	__SMU_DUMMY_MAP(SetSoftMinGl2clk), \
+-	__SMU_DUMMY_MAP(GetSystemMetricsVersion),
++	__SMU_DUMMY_MAP(GetSystemMetricsVersion), \
++	__SMU_DUMMY_MAP(IspStutterOn_MmhubPgDis), \
++	__SMU_DUMMY_MAP(IspStutterOff_MmhubPgEn),
+ 
+ #undef __SMU_DUMMY_MAP
+ #define __SMU_DUMMY_MAP(type)	SMU_MSG_##type
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_0_ppt.c
+@@ -138,6 +138,8 @@
+ 	MSG_MAP(PowerUpIspByTile,               PPSMC_MSG_PowerUpIspByTile,			1),
+ 	MSG_MAP(SetHardMinIspiclkByFreq,        PPSMC_MSG_SetHardMinIspiclkByFreq,	1),
+ 	MSG_MAP(SetHardMinIspxclkByFreq,        PPSMC_MSG_SetHardMinIspxclkByFreq,	1),
++	MSG_MAP(IspStutterOn_MmhubPgDis,        PPSMC_Message_IspStutterOn_MmhubPgDis,	1),
++	MSG_MAP(IspStutterOff_MmhubPgEn,        PPSMC_Message_IspStutterOff_MmhubPgEn,	1),
+ 	MSG_MAP(PowerUpVpe,                     PPSMC_MSG_PowerUpVpe,				1),
+ 	MSG_MAP(PowerDownVpe,                   PPSMC_MSG_PowerDownVpe,				1),
+ 	MSG_MAP(PowerUpUmsch,                   PPSMC_MSG_PowerUpUmsch,				1),
+@@ -1562,12 +1564,38 @@
+ 					       0, NULL);
+ }
+ 
++/*
++ * GZ302 camera bring-up: the ISP's MIPI write DMA is a real-time client.  The Windows camera driver switches
++ * the ISP memory path to "stutter on, MMHUB power gating off" while it streams large (> 12 MP) images and back
++ * when it stops (isp_memory_stutter_status_transfer in amdcamera.sys); without it the write DMA overflows its
++ * latency buffer (INTR_LATENCY_BUFFER_LEAKING).  The PMFW messages exist for this (0x2F / 0x30); send them right
++ * after powering the ISP tiles up and right before powering them down.  The argument is not documented; 0 is
++ * used, as for the other parameterless messages.  A failure is only logged: the ISP still works without it.
++ */
+ static int smu_v14_0_0_set_isp_enable(struct smu_context *smu,
+ 				      bool enable)
+ {
+-	return smu_cmn_send_smc_msg_with_param(smu, enable ?
++	int ret;
++
++	if (!enable) {
++		ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_IspStutterOff_MmhubPgEn, 0, NULL);
++		if (ret)
++			dev_warn(smu->adev->dev, "ISP stutter off / MMHUB PG enable failed: %d\n", ret);
++	}
++
++	ret = smu_cmn_send_smc_msg_with_param(smu, enable ?
+ 				      SMU_MSG_PowerUpIspByTile : SMU_MSG_PowerDownIspByTile,
+ 				      ISP_ALL_TILES_MASK, NULL);
++	if (ret || !enable)
++		return ret;
++
++	ret = smu_cmn_send_smc_msg_with_param(smu, SMU_MSG_IspStutterOn_MmhubPgDis, 0, NULL);
++	if (ret)
++		dev_warn(smu->adev->dev, "ISP stutter on / MMHUB PG disable failed: %d\n", ret);
++	else
++		dev_info(smu->adev->dev, "ISP stutter on / MMHUB PG disabled\n");
++
++	return 0;
+ }
+ 
+ static int smu_v14_0_0_set_umsch_mm_enable(struct smu_context *smu,

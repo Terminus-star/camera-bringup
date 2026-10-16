@@ -76,7 +76,7 @@ say "     sudo limine-enroll-config"
 step=$((step + 1))
 say "$step) remember_last_entry is on: pick a normal CachyOS entry once so the next boot is not the test kernel."
 step=$((step + 1))
-say "$step) project files that can go when you are done (optional): scratch/winfw/ (contains the Windows firmware, do not share it)."
+say "$step) project files that can go when you are done (optional): firmware/ (contains the Windows firmware, do not share it)."
 
 say
 if (( problems )); then

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Build the experimental amd_isp4_capture.ko (START_STREAM buffer-threshold test).
 #
-# What it does: compiles scratch/isp4-threshold/ as an out-of-tree module against the
+# What it does: compiles driver/ as an out-of-tree module against the
 # kernel headers of the 7.2.0-1.7-cachyos kernel (extracted into scratch/headers-1.7/),
 # so the module's vermagic matches that kernel and NOT the currently running 7.2.9 one.
 #
-# Nothing is installed or loaded.  Output: scratch/isp4-threshold/amd_isp4_capture.ko
+# Nothing is installed or loaded.  Output: driver/amd_isp4_capture.ko
 #
 # Run from the project directory:   ./scripts/build-isp4-threshold.sh
 set -euo pipefail
@@ -13,7 +13,7 @@ set -euo pipefail
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 kver=7.2.0-1.7-cachyos
 kdir="$project_dir/scratch/headers-1.7/usr/lib/modules/$kver/build"
-src="$project_dir/scratch/isp4-threshold"
+src="$project_dir/driver"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
