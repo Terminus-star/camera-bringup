@@ -1,0 +1,1638 @@
+From: GZ302 camera enablement <local@termis>
+Subject: [PATCH] media: amd: isp4: GZ302 OV13B10 capture support
+
+Squash of the out-of-tree driver patches 0009-0037 (see driver/README.md in the
+camera-bringup repo for what each one does and why): firmware memory pool sized
+like Windows, MMHUB prefetch for the RT pipe, I2C descriptors in the device
+script, round-robin meta-data resend, starting the OV13B10 from the ISP subdev,
+and loading the Windows-derived device script, sensor properties and D-PHY
+sequence from /lib/firmware/amdgpu/gz302-ov13b-*.bin.
+
+Still contains EXPERIMENT (GZ302) debug code; not for upstream as is.
+
+---
+diff --git a/drivers/media/platform/amd/isp4/isp4_debug.c b/drivers/media/platform/amd/isp4/isp4_debug.c
+--- a/drivers/media/platform/amd/isp4/isp4_debug.c
++++ b/drivers/media/platform/amd/isp4/isp4_debug.c
+@@ -107,7 +107,7 @@
+ 					*le = 0;
+ 
+ 				if (*str != '\0')
+-					dev_dbg(isp->dev, "%s", str);
++					dev_info(isp->dev, "EXP-FWLOG: %s", str);
+ 
+ 				if (le) {
+ 					*le = 0x0A;
+@@ -120,13 +120,31 @@
+ 
+ 				temp_ch = str[tmp_len];
+ 				str[tmp_len] = 0;
+-				dev_dbg(isp->dev, "%s", str);
++				dev_info(isp->dev, "EXP-FWLOG: %s", str);
+ 				str[tmp_len] = temp_ch;
+ 				str = &str[tmp_len];
+ 			}
+ 		}
+ 	}
+ }
++
++/*
++ * EXPERIMENT (GZ302 bring-up, not for upstream).
++ *
++ * isp_fw_log_print() is normally only called when the response thread handles a response, so
++ * log text the firmware writes after its last response is never read.  This drains the firmware
++ * log ring on demand and reports the ring's own pointers, so "log empty" and "log never read"
++ * can be told apart.  Lines are printed as "EXP-FWLOG: <text>".
++ */
++void isp_fw_log_dump(struct isp4_subdev *isp, const char *when)
++{
++	u32 rd = isp4hw_rreg(isp->mmio, ISP_LOG_RB_RPTR0);
++	u32 wr = isp4hw_rreg(isp->mmio, ISP_LOG_RB_WPTR0);
++
++	dev_info(isp->dev, "EXP-FWLOG[%s]: log ring rd %u wr %u, enable_fw_log %d\n",
++		 when, rd, wr, isp->enable_fw_log);
++	isp_fw_log_print(isp);
++}
+ #endif
+ 
+ char *isp4dbg_get_buf_src_str(u32 src)
+diff --git a/drivers/media/platform/amd/isp4/isp4_interface.c b/drivers/media/platform/amd/isp4/isp4_interface.c
+--- a/drivers/media/platform/amd/isp4/isp4_interface.c
++++ b/drivers/media/platform/amd/isp4/isp4_interface.c
+@@ -3,12 +3,98 @@
+  * Copyright (C) 2025 Advanced Micro Devices, Inc.
+  */
+ 
++#include <linux/firmware.h>
+ #include <linux/iopoll.h>
++#include <linux/kernel_read_file.h>
++#include <linux/moduleparam.h>
++#include <linux/sizes.h>
++#include <linux/vmalloc.h>
+ 
+ #include "isp4_debug.h"
+ #include "isp4_fw_cmd_resp.h"
+ #include "isp4_hw_reg.h"
+ #include "isp4_interface.h"
++/*
++ * EXPERIMENT (GZ302, patch 0037): the three payloads generated from the Windows driver (device script,
++ * sensor properties, D-PHY receiver sequence) are no longer compiled in.  They are loaded at run time with
++ * request_firmware() from /lib/firmware/amdgpu/; tools/header_to_fw.py produces them from the generated
++ * headers.  A missing or malformed file is logged and that step is skipped.
++ */
++#define EXP_FW_SCRIPT		"amdgpu/gz302-ov13b-script.bin"
++#define EXP_FW_SENSOR_PROP	"amdgpu/gz302-ov13b-sensor-prop.bin"
++#define EXP_FW_PHY_SEQ		"amdgpu/gz302-ov13b-phy-seq.bin"
++#define EXP_SCRIPT_SIZE		5868	/* SET_DEVICE_SCRIPT payload */
++#define EXP_SENSOR_PROP_SIZE	360	/* SET_SENSOR_PROP payload */
++
++/* gz302-ov13b-phy-seq.bin: header, then count operations (little-endian) */
++#define EXP_PHY_MAGIC		0x48505a47	/* "GZPH" */
++#define EXP_PHY_VERSION		1
++#define ISP4_PHY_OP_RMW		0
++#define ISP4_PHY_OP_WRITE	1
++
++struct exp_phy_hdr {
++	__le32 magic;
++	__le32 version;
++	__le32 phy;
++	__le32 rate_mbps;
++	__le32 lanes;
++	__le32 count;
++};
++
++struct isp4_phy_op {
++	__le16 reg;
++	__le16 mask;
++	__le16 val;
++	__le16 kind;
++};
++
++static const struct firmware *isp4if_exp_get_fw(struct device *dev, const char *name, size_t want)
++{
++	const struct firmware *fw;
++	int ret = request_firmware(&fw, name, dev);
++
++	if (ret) {
++		dev_err(dev, "EXP-FW: cannot load %s: %d (make it with tools/header_to_fw.py and copy it to /lib/firmware/)\n",
++			name, ret);
++		return NULL;
++	}
++	if (want && fw->size != want) {
++		dev_err(dev, "EXP-FW: %s has %zu bytes, expected %zu\n", name, fw->size, want);
++		release_firmware(fw);
++		return NULL;
++	}
++	dev_info(dev, "EXP-FW: loaded %s (%zu bytes)\n", name, fw->size);
++	return fw;
++}
++
++/* EXPERIMENT (GZ302): firmware-visible copy of the tuning file, see isp4if_replay_tuning() */
++static struct isp4if_gpu_mem_info *exp_tuning_mem;
++
++/*
++ * EXPERIMENT (GZ302): size of the firmware memory pool in MiB.  The stock driver sends 100 MiB
++ * (ISP4FW_MEMORY_POOL_SIZE, sized for the OV05C10); the Windows driver allocates 200 MiB
++ * (findings section 30) and the firmware runs out of internal buffers for the 13 MP OV13B mode with 100.
++ * Patch 0035: 0 (default) = computed like Windows' allocate_fw_mempool_imp from the sensor pixel count
++ * (findings section 75), 275,054,592 bytes for 4208 x 3120; any other value = that many MiB.
++ */
++static unsigned int fw_mem_pool_mb;
++module_param(fw_mem_pool_mb, uint, 0444);
++MODULE_PARM_DESC(fw_mem_pool_mb,
++		 "EXPERIMENT: firmware memory pool size in MiB (0 = computed like Windows for the OV13B, 262.3 MiB)");
++
++#define EXP_SENSOR_PIXELS	(4208 * 3120)	/* OV13B mode 0, the only mode used */
++
++/* Windows' pool-size formula (amdcamera.sys allocate_fw_mempool_imp, flag 0), w = sensor pixel count */
++static u64 isp4if_exp_pool_size(u32 w)
++{
++	u32 a = (2 * w + 0x7ffe) & 0xffff8000;
++	u32 h = w >> 1;
++	u32 b = ((h + 0x7fff) & 0xffff8000) + 0x798000;
++	u32 c = (6 * w + 0x1fffc) & 0xfffe0000;
++	u32 d = (h + 0x1fffc) & 0xfffe0000;
++
++	return 5ULL * a + 4ULL * b + c + d;
++}
+ 
+ #define ISP4IF_FW_RESP_RB_IRQ_EN_MASK \
+ 	(ISP_SYS_INT0_EN__SYS_INT_RINGBUFFER_WPT9_EN_MASK\
+@@ -164,6 +250,14 @@
+ 	isp4if_gpu_mem_free(ispif, &ispif->fw_cmd_resp_buf);
+ 	isp4if_gpu_mem_free(ispif, &ispif->fw_log_buf);
+ 
++	/* EXPERIMENT: only allocated when replay_sensor_setup=1 */
++	if (ispif->exp_sensor_script)
++		isp4if_gpu_mem_free(ispif, &ispif->exp_sensor_script);
++	if (ispif->exp_sensor_prop)
++		isp4if_gpu_mem_free(ispif, &ispif->exp_sensor_prop);
++	if (exp_tuning_mem)
++		isp4if_gpu_mem_free(ispif, &exp_tuning_mem);
++
+ 	for (unsigned int i = 0; i < ISP4IF_MAX_STREAM_BUF_COUNT; i++)
+ 		isp4if_gpu_mem_free(ispif, &ispif->meta_info_buf[i]);
+ }
+@@ -172,8 +266,12 @@
+ {
+ 	struct device *dev = ispif->dev;
+ 
+-	ispif->fw_mem_pool = isp4if_gpu_mem_alloc(ispif,
+-						  ISP4FW_MEMORY_POOL_SIZE);
++	u64 pool_size = fw_mem_pool_mb ? (u64)fw_mem_pool_mb * SZ_1M :
++					 isp4if_exp_pool_size(EXP_SENSOR_PIXELS);
++
++	dev_info(dev, "EXP: firmware memory pool %llu bytes (%s)\n", pool_size,
++		 fw_mem_pool_mb ? "fw_mem_pool_mb" : "computed like Windows");
++	ispif->fw_mem_pool = isp4if_gpu_mem_alloc(ispif, pool_size);
+ 	if (!ispif->fw_mem_pool)
+ 		goto error_no_memory;
+ 
+@@ -327,6 +425,14 @@
+ 
+ static inline enum isp4if_stream_id isp4if_get_fw_stream(u32 cmd_id)
+ {
++	/*
++	 * EXPERIMENT (GZ302, patch 0029): commands of type 0x01 (bits 31:24 of the command id) are the
++	 * "global" commands (Windows STREAM_GLOBAL, e.g. ENABLE_PREFETCH 0x01030003) and belong on the global
++	 * ring.  Every command the driver sent before is of type 0x02 and still goes to stream 1.
++	 */
++	if ((cmd_id >> 24) == 0x01)
++		return ISP4IF_STREAM_ID_GLOBAL;
++
+ 	return ISP4IF_STREAM_ID_1;
+ }
+ 
+@@ -380,6 +486,14 @@
+ 	if (package && package_size)
+ 		memcpy(cmd.cmd_param, package, package_size);
+ 
++	if (sync) {
++		/* EXPERIMENT: ring state just before a synchronous command (disable channel / stop) */
++		char tag[64];
++
++		snprintf(tag, sizeof(tag), "before %s", isp4dbg_get_cmd_str(cmd_id));
++		isp4if_dump_rings(ispif, tag);
++	}
++
+ 	scoped_guard(mutex, &ispif->isp4if_mutex) {
+ 		ret = read_poll_timeout(isp4if_is_cmdq_rb_full, ret, !ret,
+ 					ISP4IF_RB_FULL_SLEEP_US,
+@@ -432,6 +546,11 @@
+ 		ret = wait_for_completion_timeout(&ele->cmd_done,
+ 						  ISP4IF_FW_CMD_TIMEOUT);
+ 		if (!ret) {
++			/* EXPERIMENT: ring state when the firmware did not answer in time */
++			char tag[64];
++
++			snprintf(tag, sizeof(tag), "TIMEOUT %s", isp4dbg_get_cmd_str(cmd_id));
++			isp4if_dump_rings(ispif, tag);
+ 			ret = -ETIMEDOUT;
+ 			goto err_dequeue_ele;
+ 		}
+@@ -704,6 +823,588 @@
+ 	return -EINVAL;
+ }
+ 
++/*
++ * EXPERIMENT (GZ302 bring-up, not for upstream).
++ *
++ * Log the read/write pointers of the command and response rings plus the interrupt registers,
++ * so a silent firmware can be told apart from responses that were written but never read:
++ *   - cmd rd != cmd wr  : the firmware has not consumed every command the host queued.
++ *   - resp rd != resp wr: the firmware wrote responses the host has not consumed; the first
++ *                         unread one is decoded here without moving the read pointer.
++ * Pointers are byte offsets into the ring. The union fields are printed raw: they only mean
++ * something when resp_id is ISP4FW_RESP_ID_CMD_DONE.
++ */
++/*
++ * EXPERIMENT (GZ302, patch 0024): the ISP's own pin controller (drivers/pinctrl/pinctrl-amdisp.c) has three
++ * output-only pins, GPIO_0/1/2 = "sensor0/1/2 control", at ISP offsets 0x6613c, 0x66140 and 0x6618c; the output
++ * value is bit 4.  Linux only drives sensor0.  They are printed in every EXP-RING snapshot, to see which one is
++ * high while the front-camera LED is lit (findings section 53).  The window lies outside ispif->mmio (which ends at
++ * 0x629a4), so it is mapped once in isp4if_init() (process context) with a plain devm_ioremap().
++ */
++#define EXP_ISPGPIO_BASE	0x6613c
++#define EXP_ISPGPIO_SIZE	0x54
++#define EXP_ISPGPIO_0		0x00
++#define EXP_ISPGPIO_1		0x04
++#define EXP_ISPGPIO_2		0x50
++#define EXP_ISPGPIO_OUT_BIT	4
++
++static void __iomem *exp_ispgpio;
++
++void isp4if_dump_rings(struct isp4_interface *ispif, const char *when)
++{
++	struct device *dev = ispif->dev;
++
++	/* Also drain the firmware log ring: it is otherwise only read when a response arrives. */
++	isp_fw_log_dump(container_of(ispif, struct isp4_subdev, ispif), when);
++
++	dev_info(dev, "EXP-RING[%s]: INT0_EN 0x%08x INT0_STATUS 0x%08x ISP_STATUS 0x%08x\n",
++		 when, isp4hw_rreg(ispif->mmio, ISP_SYS_INT0_EN),
++		 isp4hw_rreg(ispif->mmio, ISP_SYS_INT0_STATUS),
++		 isp4hw_rreg(ispif->mmio, ISP_STATUS));
++
++	if (exp_ispgpio) {
++		u32 g0 = readl(exp_ispgpio + EXP_ISPGPIO_0);
++		u32 g1 = readl(exp_ispgpio + EXP_ISPGPIO_1);
++		u32 g2 = readl(exp_ispgpio + EXP_ISPGPIO_2);
++
++		dev_info(dev, "EXP-RING[%s]: ISP sensor-control pins gpio0 0x%08x gpio1 0x%08x gpio2 0x%08x (output bit 4: %u %u %u)\n",
++			 when, g0, g1, g2, (g0 >> EXP_ISPGPIO_OUT_BIT) & 1,
++			 (g1 >> EXP_ISPGPIO_OUT_BIT) & 1, (g2 >> EXP_ISPGPIO_OUT_BIT) & 1);
++	}
++
++	for (int s = ISP4IF_STREAM_ID_GLOBAL; s <= ISP4IF_STREAM_ID_1; s++) {
++		const struct isp4if_rb_config *c = &isp4if_cmd_rb_config[s];
++		const struct isp4if_rb_config *r = &isp4if_resp_rb_config[s];
++		u32 c_rd = isp4hw_rreg(ispif->mmio, c->reg_rptr);
++		u32 c_wr = isp4hw_rreg(ispif->mmio, c->reg_wptr);
++		u32 r_rd = isp4hw_rreg(ispif->mmio, r->reg_rptr);
++		u32 r_wr = isp4hw_rreg(ispif->mmio, r->reg_wptr);
++
++		dev_info(dev, "EXP-RING[%s]: %s rd %u wr %u | %s rd %u wr %u | ring size %u\n",
++			 when, c->name, c_rd, c_wr, r->name, r_rd, r_wr, r->val_size);
++
++		if (r_rd != r_wr && r->base_sys_addr && r_rd < r->val_size &&
++		    r->val_size - r_rd >= sizeof(struct isp4fw_resp)) {
++			const struct isp4fw_resp *p = r->base_sys_addr + r_rd;
++
++			dev_info(dev, "EXP-RING[%s]:   unread on %s: seq %u resp_id 0x%x cmd_id 0x%x cmd_status %u\n",
++				 when, r->name, p->resp_seq_num, p->resp_id,
++				 p->param.cmd_done.cmd_id, p->param.cmd_done.cmd_status);
++		}
++	}
++}
++
++/*
++ * EXPERIMENT (GZ302 bring-up, not for upstream): replay of the Windows sensor setup.
++ *
++ * Windows sends, before SET_STREAM_CONFIG: SET_DEVICE_SCRIPT, then (not for the OV13B, whose
++ * embedded-property getter reports "unsupported") SET_SENSOR_EMB_PROP, then SET_SENSOR_PROP.
++ * Each is an "indirect" command: the payload sits in firmware-visible memory and the command
++ * carries {GPU address lo, hi, size, checksum}.  Linux sends none of them.
++ *
++ * Off unless replay_sensor_setup=1.  Commands are sent synchronously so the log shows, per
++ * command, whether the firmware answered within ISP4IF_FW_CMD_TIMEOUT; a timeout is only logged.
++ */
++#define EXP_CMD_ID_SET_SENSOR_PROP	0x02090001
++#define EXP_CMD_ID_SET_DEVICE_SCRIPT	0x02090002
++
++static bool replay_sensor_setup = true;	/* patch 0035: default on */
++module_param(replay_sensor_setup, bool, 0644);
++MODULE_PARM_DESC(replay_sensor_setup,
++		 "EXPERIMENT: send the Windows sensor setup (script + sensor properties) before SET_STREAM_CONFIG");
++
++/*
++ * EXPERIMENT (GZ302, patch 0032): every device-script function fails in the firmware with
++ * "SvmSetI2c: Set i2c addr mode not 7bit nor 10bit" / "SvmRun: set I2C arg fail", even
++ * SensorConvertAGain, which has no I2C instruction: the script VM sets up its I2C target from a
++ * per-sensor descriptor before running any function, and ours is invalid (findings section 86).
++ * The SET_DEVICE_SCRIPT payload ends in four 20-byte descriptors at 0x169c + k*0x14, laid out like
++ * the firmware's own print "i2cSensor={deviceId,enRestart,deviceAddrType,regAddrType,deviceAddr}";
++ * we send them all zero.  INFERENCE: the type codes are those of get_i2c_config_OV13B in the
++ * Windows plug-in, 0x102 for the sensor at 0x10 and 0x101 for the focus motor at 0x0c, read as
++ * (deviceAddrType << 8 | regAddrType), i.e. 1 = 7-bit device address, 2 = 16-bit registers.
++ *   script_i2c=0 off (as before), 1 descriptor 0 = sensor, 2 also descriptor 1 = focus motor,
++ *   3 all four descriptors = sensor.  script_i2c_restart is written to enRestart.
++ */
++#define EXP_SCRIPT_I2C_DESC_OFF	0x169c
++#define EXP_SCRIPT_I2C_DESC_SIZE	0x14
++
++static unsigned int script_i2c = 2;	/* patch 0035: sensor + focus motor */
++module_param(script_i2c, uint, 0444);
++MODULE_PARM_DESC(script_i2c,
++		 "EXPERIMENT: fill the SET_DEVICE_SCRIPT I2C descriptors: 0 off, 1 sensor, 2 sensor + focus motor, 3 all four = sensor");
++
++static unsigned int script_i2c_restart = 1;
++module_param(script_i2c_restart, uint, 0444);
++MODULE_PARM_DESC(script_i2c_restart, "EXPERIMENT: enRestart value for script_i2c (default 1)");
++
++static void isp4if_exp_put_i2c_desc(u8 *payload, unsigned int k, u32 addr, u32 code)
++{
++	u32 *d = (u32 *)(payload + EXP_SCRIPT_I2C_DESC_OFF + k * EXP_SCRIPT_I2C_DESC_SIZE);
++
++	/* d[0] = deviceId: left as built (the sensor index, 0) */
++	d[1] = script_i2c_restart;
++	d[2] = (code >> 8) & 0xff;	/* deviceAddrType */
++	d[3] = code & 0xff;		/* regAddrType */
++	d[4] = addr;			/* deviceAddr */
++}
++
++static void isp4if_exp_script_i2c(struct device *dev, u8 *payload)
++{
++	unsigned int k;
++
++	isp4if_exp_put_i2c_desc(payload, 0, 0x10, 0x102);
++	if (script_i2c == 2)
++		isp4if_exp_put_i2c_desc(payload, 1, 0x0c, 0x101);
++	if (script_i2c == 3)
++		for (k = 1; k < 4; k++)
++			isp4if_exp_put_i2c_desc(payload, k, 0x10, 0x102);
++
++	dev_info(dev, "EXP-SCRIPT-I2C: mode %u, descriptors %*ph\n", script_i2c,
++		 4 * EXP_SCRIPT_I2C_DESC_SIZE, payload + EXP_SCRIPT_I2C_DESC_OFF);
++}
++
++static void isp4if_replay_one(struct isp4_interface *ispif, u32 cmd_id, const char *what,
++			      const void *data, u32 len,
++			      struct isp4if_gpu_mem_info **slot)
++{
++	struct device *dev = ispif->dev;
++	struct isp4if_gpu_mem_info *mem;
++	u32 pkg[4];
++	int ret;
++
++	mem = isp4if_gpu_mem_alloc(ispif, ALIGN(len, SZ_4K));
++	if (!mem) {
++		dev_err(dev, "EXP-REPLAY: %s: no GPU memory for %u bytes\n", what, len);
++		return;
++	}
++	*slot = mem;
++
++	memset(mem->sys_addr, 0, mem->mem_size);
++	memcpy(mem->sys_addr, data, len);
++
++	/* patch 0032: fill the script's I2C descriptors before the checksum is computed */
++	if (cmd_id == EXP_CMD_ID_SET_DEVICE_SCRIPT && script_i2c &&
++	    len >= EXP_SCRIPT_I2C_DESC_OFF + 4 * EXP_SCRIPT_I2C_DESC_SIZE)
++		isp4if_exp_script_i2c(dev, mem->sys_addr);
++
++	isp4if_split_addr64(mem->gpu_mc_addr, &pkg[0], &pkg[1]);
++	pkg[2] = len;
++	pkg[3] = isp4if_compute_check_sum(mem->sys_addr, len);
++
++	ret = isp4if_send_command_sync(ispif, cmd_id, pkg, sizeof(pkg));
++	dev_info(dev,
++		 "EXP-REPLAY: %s: cmd 0x%08x, %u bytes at GPU 0x%llx, checksum 0x%08x -> %s (%d)\n",
++		 what, cmd_id, len, mem->gpu_mc_addr, pkg[3],
++		 ret ? "NO ANSWER / FAILED" : "answered", ret);
++}
++
++/*
++ * SET_SENSOR_PROP was rejected with fw_error_code 0x1b (findings section 18).  Send altered copies
++ * of the payload and watch whether the code changes (EXP-RESP line): a different code means a
++ * different check failed.
++ *   0 = as built from get_caps_OV13B (360 bytes)
++ *   1 = only the caps structure, without the 8-byte {sensor id, 0} prefix (352 bytes)
++ *   2 = sensor id 1 instead of 0
++ *   3 = 360 zero bytes (shows what the firmware says to garbage)
++ */
++static unsigned int sensor_prop_variant;
++module_param(sensor_prop_variant, uint, 0644);
++MODULE_PARM_DESC(sensor_prop_variant,
++		 "EXPERIMENT: SET_SENSOR_PROP payload: 0 as built, 1 caps only (352 B), 2 sensor id 1, 3 all zero");
++
++static void isp4if_replay_sensor_prop(struct isp4_interface *ispif)
++{
++	const struct firmware *fw;
++	u32 len = EXP_SENSOR_PROP_SIZE;
++	const u8 *data;
++	u8 *copy;
++
++	/* patch 0037: payload from /lib/firmware instead of a compiled-in table */
++	fw = isp4if_exp_get_fw(ispif->dev, EXP_FW_SENSOR_PROP, EXP_SENSOR_PROP_SIZE);
++	if (!fw)
++		return;
++	data = fw->data;
++
++	copy = kmemdup(fw->data, len, GFP_KERNEL);
++	if (!copy) {
++		dev_err(ispif->dev, "EXP-REPLAY: SET_SENSOR_PROP: no memory for the variant copy\n");
++		release_firmware(fw);
++		return;
++	}
++
++	switch (sensor_prop_variant) {
++	case 0:
++		break;
++	case 1:
++		data = copy + 8;
++		len -= 8;
++		break;
++	case 2:
++		copy[0] = 1;
++		data = copy;
++		break;
++	case 3:
++		memset(copy, 0, len);
++		data = copy;
++		break;
++	default:
++		dev_warn(ispif->dev, "EXP-REPLAY: unknown sensor_prop_variant %u, using 0\n",
++			 sensor_prop_variant);
++		break;
++	}
++
++	dev_info(ispif->dev, "EXP-REPLAY: SET_SENSOR_PROP variant %u, %u bytes\n",
++		 sensor_prop_variant, len);
++	isp4if_replay_one(ispif, EXP_CMD_ID_SET_SENSOR_PROP, "SET_SENSOR_PROP", data, len,
++			  &ispif->exp_sensor_prop);
++	kfree(copy);
++	release_firmware(fw);
++}
++
++/*
++ * Does 0x1b mean "this command is not supported" (findings section 19)?  Send a command ID that
++ * cannot exist and compare the firmware's error code in the EXP-RESP line with the 0x1b of
++ * SET_SENSOR_PROP.  Same code = the firmware treats SET_SENSOR_PROP like an unknown command.
++ * 0 = off.  Accepts decimal or 0x.. hex.
++ */
++static unsigned int bogus_cmd;
++module_param(bogus_cmd, uint, 0644);
++MODULE_PARM_DESC(bogus_cmd,
++		 "EXPERIMENT: also send this (invalid) command ID, e.g. 0x0badbad, to learn the firmware's error code for unknown commands; 0 = off");
++
++static void isp4if_replay_bogus_cmd(struct isp4_interface *ispif)
++{
++	u32 pkg[4] = { 0, 0, 0, 0 };
++	int ret;
++
++	if (!bogus_cmd)
++		return;
++
++	ret = isp4if_send_command_sync(ispif, bogus_cmd, pkg, sizeof(pkg));
++	dev_info(ispif->dev, "EXP-REPLAY: BOGUS cmd 0x%08x (4 zero words) -> %s (%d)\n", bogus_cmd,
++		 ret ? "NO ANSWER / FAILED" : "answered", ret);
++}
++
++/*
++ * EXPERIMENT (GZ302): start the MIPI D-PHY receiver from the host, as the Windows driver does for the
++ * Strix variants (findings section 41, function startup_seq_cdphy_rx).  The firmware arms the receiver but
++ * counts zero frame starts although the sensor streams, and the Linux ISP4 driver has no PHY code.
++ * The analog register list (since patch 0037 the file amdgpu/gz302-ov13b-phy-seq.bin) was evaluated offline for phy 0, 1120 Mbps, 4 lanes.
++ * Off unless phy_init=1; called from the sensor start helper, with the sensor powered.
++ *
++ * Registers are ISP byte offsets, as in the Windows driver.  NOTE the mapping: ispif->mmio only covers
++ * 0x0-0x629a4 (amdgpu's "isp_4_1_1_reg" resource); the PHY controller (0x66700-0x67430) is a separate resource
++ * ("isp_4_1_1_phy0_reg") and the global PHY reset 0x66108 lies in neither, so the first version of this code
++ * oopsed on 0x66108.  The range 0x66000-0x67fff is therefore mapped separately below, from the physical start
++ * of the capture device's register resource.  Per-PHY controller at 0x66700 + 0x80 * phy for phy 0/1 (phy 0 is
++ * used): +0x00 control (3 = enable), +0x04 mode (0 = D-PHY), +0x10 lane enable mask, +0x14 lane reset, +0x1c
++ * status (bit 0 = ready), +0x24/+0x28 indirect PHY register address/data.  0x66108 is the global PHY reset
++ * (bit = phy).  Lane stop-state status lives at 0x68008, outside any mapped range, so it is read through the
++ * index/data pair at 0x61f08/0x61f0c, which lies inside ispif->mmio.
++ */
++#define EXP_PHY_WIN		0x66000
++#define EXP_PHY_WIN_SIZE	0x2000
++#define EXP_PHY_GLOBAL_RESET	0x66108
++#define EXP_PHY_BASE		0x66700
++#define EXP_PHY_STOPSTATE	0x68008
++#define EXP_IND_INDEX		0x61f08
++#define EXP_IND_DATA		0x61f0c
++
++static bool phy_init = true;	/* patch 0035: default on */
++module_param(phy_init, bool, 0444);
++MODULE_PARM_DESC(phy_init,
++		 "EXPERIMENT: start the MIPI D-PHY receiver from the host like Windows (needs start_sensor)");
++
++bool isp4if_phy_init_enabled(void)
++{
++	return phy_init;
++}
++
++/* w = mapping of ISP offsets EXP_PHY_WIN.. (see above); off = absolute ISP byte offset inside that range */
++static u32 phy_rd32(void __iomem *w, u32 off)
++{
++	return readl(w + (off - EXP_PHY_WIN));
++}
++
++static void phy_wr32(void __iomem *w, u32 off, u32 val)
++{
++	writel(val, w + (off - EXP_PHY_WIN));
++}
++
++static u16 exp_phy_rd(void __iomem *w, u16 reg)
++{
++	phy_wr32(w, EXP_PHY_BASE + 0x24, reg);
++	return phy_rd32(w, EXP_PHY_BASE + 0x28) & 0xffff;
++}
++
++static void exp_phy_wr(void __iomem *w, u16 reg, u16 val)
++{
++	phy_wr32(w, EXP_PHY_BASE + 0x24, reg);
++	phy_wr32(w, EXP_PHY_BASE + 0x28, val);
++}
++
++/* Windows FUN_14005131c: replace the bits selected by mask with val shifted to the lowest set bit of mask. */
++static void exp_phy_rmw(void __iomem *w, u16 reg, u16 mask, u16 val)
++{
++	u16 old = exp_phy_rd(w, reg);
++	unsigned int sh = mask ? __ffs(mask) : 0;
++
++	exp_phy_wr(w, reg, (old & ~mask) | ((val << sh) & mask));
++}
++
++int isp4if_phy_init(struct isp4_interface *ispif)
++{
++	void __iomem *m = ispif->mmio;		/* only for the index/data pair at 0x61f08/0x61f0c */
++	struct device *dev = ispif->dev;
++	const struct exp_phy_hdr *hdr;
++	const struct isp4_phy_op *ops;
++	const struct firmware *fw;
++	u32 phy, rate, lanes, count;
++	u32 lane_mask, lane_rst;	/* 4 lanes: 0x1f and 0xf */
++	struct resource *res;
++	void __iomem *w;
++	u32 r, ready = 0, stop = 0, want;
++	unsigned int i;
++
++	if (!phy_init)
++		return 0;
++
++	/* patch 0037: the analog register list comes from /lib/firmware (tools/header_to_fw.py) */
++	fw = isp4if_exp_get_fw(dev, EXP_FW_PHY_SEQ, 0);
++	if (!fw)
++		return -ENOENT;
++	hdr = (const struct exp_phy_hdr *)fw->data;
++	if (fw->size < sizeof(*hdr) || le32_to_cpu(hdr->magic) != EXP_PHY_MAGIC ||
++	    le32_to_cpu(hdr->version) != EXP_PHY_VERSION) {
++		dev_err(dev, "EXP-PHY: %s: bad header\n", EXP_FW_PHY_SEQ);
++		release_firmware(fw);
++		return -EINVAL;
++	}
++	phy = le32_to_cpu(hdr->phy);
++	rate = le32_to_cpu(hdr->rate_mbps);
++	lanes = le32_to_cpu(hdr->lanes);
++	count = le32_to_cpu(hdr->count);
++	if (phy > 3 || lanes < 1 || lanes > 4 || fw->size != sizeof(*hdr) + (size_t)count * sizeof(*ops)) {
++		dev_err(dev, "EXP-PHY: %s: phy %u, lanes %u, %u operations do not match %zu bytes\n",
++			EXP_FW_PHY_SEQ, phy, lanes, count, fw->size);
++		release_firmware(fw);
++		return -EINVAL;
++	}
++	ops = (const struct isp4_phy_op *)(fw->data + sizeof(*hdr));
++	lane_mask = (2U << lanes) - 1;
++	lane_rst = (1U << lanes) - 1;
++
++	/* ISP offset 0 is the start of the capture device's first memory resource (see the comment above) */
++	res = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(dev, "EXP-PHY: no memory resource on the capture device\n");
++		release_firmware(fw);
++		return -ENODEV;
++	}
++	w = ioremap(res->start + EXP_PHY_WIN, EXP_PHY_WIN_SIZE);
++	if (!w) {
++		dev_err(dev, "EXP-PHY: cannot map the PHY register range\n");
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++	dev_info(dev, "EXP-PHY: mapped ISP offsets 0x%x-0x%x (physical 0x%llx)\n", EXP_PHY_WIN,
++		 EXP_PHY_WIN + EXP_PHY_WIN_SIZE - 1, (unsigned long long)(res->start + EXP_PHY_WIN));
++
++	dev_info(dev, "EXP-PHY: starting the D-PHY receiver (phy %u, %u Mbps, %u lanes), %u register operations\n",
++		 phy, rate, lanes, count);
++	dev_info(dev, "EXP-PHY: before: global reset 0x%08x, ctl 0x%08x, status 0x%08x\n",
++		 phy_rd32(w, EXP_PHY_GLOBAL_RESET), phy_rd32(w, EXP_PHY_BASE),
++		 phy_rd32(w, EXP_PHY_BASE + 0x1c));
++
++	/* All-ones on every register means the block is not reachable (powered down, wrong address): do not write. */
++	if (phy_rd32(w, EXP_PHY_GLOBAL_RESET) == 0xffffffff && phy_rd32(w, EXP_PHY_BASE + 0x1c) == 0xffffffff) {
++		dev_err(dev, "EXP-PHY: PHY registers read as all-ones; not touching them\n");
++		iounmap(w);
++		release_firmware(fw);
++		return -EIO;
++	}
++
++	/* 1. pulse the PHY's bit in the global reset register */
++	r = phy_rd32(w, EXP_PHY_GLOBAL_RESET);
++	phy_wr32(w, EXP_PHY_GLOBAL_RESET, r | BIT(phy));
++	usleep_range(1000, 1500);
++	r = phy_rd32(w, EXP_PHY_GLOBAL_RESET);
++	phy_wr32(w, EXP_PHY_GLOBAL_RESET, r & ~BIT(phy));
++
++	/* 2. disable, lane masks, D-PHY mode */
++	phy_wr32(w, EXP_PHY_BASE + 0x00, 0);
++	phy_wr32(w, EXP_PHY_BASE + 0x14, lane_rst | 0x10);
++	phy_wr32(w, EXP_PHY_BASE + 0x10, lane_mask);
++	phy_wr32(w, EXP_PHY_BASE + 0x04, 0);
++
++	/* 3. analog configuration */
++	for (i = 0; i < count; i++) {
++		const struct isp4_phy_op *op = &ops[i];
++
++		if (le16_to_cpu(op->kind) == ISP4_PHY_OP_RMW)
++			exp_phy_rmw(w, le16_to_cpu(op->reg), le16_to_cpu(op->mask), le16_to_cpu(op->val));
++		else
++			exp_phy_wr(w, le16_to_cpu(op->reg), le16_to_cpu(op->val));
++	}
++	release_firmware(fw);	/* the operations are not needed after this point */
++
++	/* 4. enable and wait for "PHY ready" (Windows waits without a limit; here at most about 100 ms) */
++	phy_wr32(w, EXP_PHY_BASE + 0x00, 3);
++	for (i = 0; i < 100; i++) {
++		usleep_range(1000, 1500);
++		ready = phy_rd32(w, EXP_PHY_BASE + 0x1c);
++		if (ready & 1)
++			break;
++	}
++
++	/* 5. lane stop-state: bits 15:8 of the status must contain the lane mask (here: at most 5 tries, then carry on) */
++	want = lane_mask;
++	for (i = 0; i < 5; i++) {
++		usleep_range(1000, 1500);
++		isp4hw_wreg(m, EXP_IND_INDEX, EXP_PHY_STOPSTATE);
++		stop = isp4hw_rreg(m, EXP_IND_DATA);
++		if (((stop >> 8) & want) == want)
++			break;
++	}
++
++	/* 6. release the lane resets (keep nothing of the 0x1f bits) */
++	phy_wr32(w, EXP_PHY_BASE + 0x14, lane_rst & 0xffffffe0);
++
++	dev_info(dev, "EXP-PHY: done: PHY ready %s (status 0x%08x), lane stop-state 0x%08x (want bits 15:8 = 0x%02x: %s), after: ctl 0x%08x\n",
++		 (ready & 1) ? "yes" : "NO", ready, stop, want, (((stop >> 8) & want) == want) ? "yes" : "NO",
++		 phy_rd32(w, EXP_PHY_BASE));
++	iounmap(w);
++	return (ready & 1) ? 0 : -ETIMEDOUT;
++}
++
++/*
++ * EXPERIMENT (GZ302, patch 0022): read-only snapshot of the D-PHY receiver state, to tell "the sensor is not
++ * transmitting" (data lanes stay in the LP-11 stop state) from "the sensor transmits but the receiver cannot decode it"
++ * (lanes leave stop state).  Logs the 13 direct dwords of the PHY controller (0x66700-0x66730), the global PHY reset
++ * and the lane stop-state.  Only reads; but the status registers may be clear-on-read, so a snapshot can clear a
++ * latched bit (observer effect).  Same separate ioremap window as isp4if_phy_init().  Needs phy_init=1.
++ */
++void isp4if_phy_diag(struct isp4_interface *ispif, const char *label)
++{
++	struct device *dev = ispif->dev;
++	struct resource *res;
++	void __iomem *w;
++	u32 stop;
++	unsigned int i;
++
++	if (!phy_init)
++		return;
++
++	res = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
++	if (!res)
++		return;
++	w = ioremap(res->start + EXP_PHY_WIN, EXP_PHY_WIN_SIZE);
++	if (!w)
++		return;
++
++	isp4hw_wreg(ispif->mmio, EXP_IND_INDEX, EXP_PHY_STOPSTATE);
++	stop = isp4hw_rreg(ispif->mmio, EXP_IND_DATA);
++	dev_info(dev, "EXP-PHYDIAG[%s]: global reset 0x%08x, lane stop-state 0x%08x (bits 15:8 = 0x%02x)\n", label,
++		 phy_rd32(w, EXP_PHY_GLOBAL_RESET), stop, (stop >> 8) & 0xff);
++	for (i = 0; i <= 0x30; i += 4)
++		dev_info(dev, "EXP-PHYDIAG[%s]: +0x%02x = 0x%08x\n", label, i, phy_rd32(w, EXP_PHY_BASE + i));
++	iounmap(w);
++}
++
++/*
++ * SET_TUNING_DATA (0x02050008), decoded from amdcamera.sys (findings section 28).  The firmware
++ * log says "Host setfile buf queue empty" / "RTA setfile buf empty" and fails START_STREAM
++ * (error 0x27) because the host never delivers the sensor tuning file.  Windows copies the file
++ * (OV13B_3001_ROG_SRX.atb, 565520 bytes) to offset 0 of a firmware-visible buffer and sends a
++ * 12-word parameter block:
++ *     [0] 14 (buffer type, "type=14" in the firmware log)   [1] 0   [2] 4 (unknown, copied)
++ *     [3],[4] GPU address lo/hi   [5] size   [6]..[8] second blob (address lo/hi, size) = 0 here
++ * The file is read at run time from the path in tuning_file, so no Windows data is in the source.
++ * Off when tuning_file is empty.
++ */
++#define EXP_CMD_ID_SET_TUNING_DATA	0x02050008
++#define EXP_TUNING_BUF_TYPE		14
++#define EXP_TUNING_AREA			0x300000	/* Windows' buffer size for the first blob */
++
++static char *tuning_file = "/lib/firmware/amdgpu/OV13B_3001_ROG_SRX.atb";	/* patch 0035 */
++module_param(tuning_file, charp, 0444);
++MODULE_PARM_DESC(tuning_file,
++		 "EXPERIMENT: path of the sensor tuning file (OV13B_3001_ROG_SRX.atb) to send with SET_TUNING_DATA; needs replay_sensor_setup=1");
++
++static void isp4if_replay_tuning(struct isp4_interface *ispif)
++{
++	struct device *dev = ispif->dev;
++	struct isp4if_gpu_mem_info *mem;
++	u32 pkg[12] = { 0 };
++	size_t size = 0;
++	void *data = NULL;
++	ssize_t rd;
++	int ret;
++
++	if (!tuning_file || !*tuning_file)
++		return;
++
++	rd = kernel_read_file_from_path(tuning_file, 0, &data, EXP_TUNING_AREA, &size,
++					READING_FIRMWARE);
++	if (rd < 0) {
++		dev_err(dev, "EXP-REPLAY: SET_TUNING_DATA: cannot read %s: %zd\n", tuning_file, rd);
++		return;
++	}
++
++	/* A previous init of this module load may have left its buffer behind. */
++	if (exp_tuning_mem)
++		isp4if_gpu_mem_free(ispif, &exp_tuning_mem);
++
++	mem = isp4if_gpu_mem_alloc(ispif, EXP_TUNING_AREA);
++	if (!mem) {
++		dev_err(dev, "EXP-REPLAY: SET_TUNING_DATA: no GPU memory for %u bytes\n", EXP_TUNING_AREA);
++		vfree(data);
++		return;
++	}
++	exp_tuning_mem = mem;
++
++	memset(mem->sys_addr, 0, mem->mem_size);
++	memcpy(mem->sys_addr, data, size);
++	vfree(data);
++
++	pkg[0] = EXP_TUNING_BUF_TYPE;
++	pkg[2] = 4;
++	isp4if_split_addr64(mem->gpu_mc_addr, &pkg[3], &pkg[4]);
++	pkg[5] = size;
++
++	ret = isp4if_send_command_sync(ispif, EXP_CMD_ID_SET_TUNING_DATA, pkg, sizeof(pkg));
++	dev_info(dev, "EXP-REPLAY: SET_TUNING_DATA: %zu bytes from %s at GPU 0x%llx -> %s (%d)\n",
++		 size, tuning_file, mem->gpu_mc_addr, ret ? "NO ANSWER / FAILED" : "answered", ret);
++}
++
++int isp4if_replay_sensor_setup(struct isp4_interface *ispif)
++{
++	const struct firmware *fw;
++
++	if (!replay_sensor_setup)
++		return 0;
++
++	dev_info(ispif->dev, "EXP-REPLAY: sending the Windows sensor setup before SET_STREAM_CONFIG\n");
++	isp4if_dump_rings(ispif, "replay: before");
++
++	/* patch 0037: the compiled device script comes from /lib/firmware */
++	fw = isp4if_exp_get_fw(ispif->dev, EXP_FW_SCRIPT, EXP_SCRIPT_SIZE);
++	if (fw) {
++		isp4if_replay_one(ispif, EXP_CMD_ID_SET_DEVICE_SCRIPT, "SET_DEVICE_SCRIPT",
++				  fw->data, fw->size, &ispif->exp_sensor_script);
++		release_firmware(fw);
++	}
++	isp4if_replay_tuning(ispif);	/* Windows order: script, (embedded prop skipped), tuning, sensor prop */
++	isp4if_replay_sensor_prop(ispif);
++	isp4if_replay_bogus_cmd(ispif);
++
++	isp4if_dump_rings(ispif, "replay: after");
++
++	/* Never fail the bring-up because of the experiment: carry on so the result can be observed. */
++	return 0;
++}
++
+ int isp4if_send_command(struct isp4_interface *ispif, u32 cmd_id,
+ 			const void *package, u32 package_size)
+ {
+@@ -816,9 +1517,19 @@
+ int isp4if_init(struct isp4_interface *ispif, struct device *dev,
+ 		void __iomem *isp_mmio)
+ {
++	struct resource *res;
++
+ 	ispif->dev = dev;
+ 	ispif->mmio = isp_mmio;
+ 
++	/* patch 0024: map the ISP sensor-control pin registers for the EXP-RING snapshots (see above) */
++	exp_ispgpio = NULL;
++	res = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
++	if (res)
++		exp_ispgpio = devm_ioremap(dev, res->start + EXP_ISPGPIO_BASE, EXP_ISPGPIO_SIZE);
++	if (!exp_ispgpio)
++		dev_warn(dev, "EXP: ISP sensor-control pin registers not mapped, they will not be logged\n");
++
+ 	spin_lock_init(&ispif->cmdq_lock); /* used for cmdq access */
+ 	spin_lock_init(&ispif->bufq_lock); /* used for bufq access */
+ 	mutex_init(&ispif->isp4if_mutex); /* used for commands sent to ispfw */
+diff --git a/drivers/media/platform/amd/isp4/isp4_subdev.c b/drivers/media/platform/amd/isp4/isp4_subdev.c
+--- a/drivers/media/platform/amd/isp4/isp4_subdev.c
++++ b/drivers/media/platform/amd/isp4/isp4_subdev.c
+@@ -3,8 +3,13 @@
+  * Copyright (C) 2025 Advanced Micro Devices, Inc.
+  */
+ 
++#include <linux/device.h>
++#include <linux/i2c.h>
++#include <linux/moduleparam.h>
+ #include <linux/pm_domain.h>
++#include <linux/pm_runtime.h>
+ #include <linux/units.h>
++#include <media/v4l2-subdev.h>
+ 
+ #include "isp4.h"
+ #include "isp4_debug.h"
+@@ -13,12 +18,458 @@
+ 
+ #define ISP4SD_MIN_BUF_CNT_BEF_START_STREAM 4
+ 
++/*
++ * EXPERIMENT (GZ302 bring-up, not for upstream): make the buffer count that
++ * gates ISP4FW_CMD_ID_START_STREAM tunable.  The default keeps the stock value
++ * so loading the module without the parameter behaves exactly as before.
++ */
++static unsigned int min_start_bufs = ISP4SD_MIN_BUF_CNT_BEF_START_STREAM;
++module_param(min_start_bufs, uint, 0644);
++MODULE_PARM_DESC(min_start_bufs,
++		 "EXPERIMENT: buffers sent to the ISP before START_STREAM (default 4, use >= 1)");
++
++/*
++ * EXPERIMENT (GZ302 bring-up, not for upstream): nothing in this driver starts the OV13B sensor,
++ * so the firmware arms its MIPI receiver and times out with zero frames (findings section 32).
++ * With start_sensor != 0 the driver finds the ov13b10 I2C client on the ISP's own I2C bus and calls
++ * its V4L2 subdev s_stream(1) (power-on, chip-ID check, PLL and mode registers, stream-on) and
++ * s_stream(0) when the stream is torn down.
++ *   0 = off (default)   1 = start after START_STREAM has been queued   2 = start before it
++ */
++#define EXP_SENSOR_I2C_NAME "i2c-ov13b10"
++
++static unsigned int start_sensor = 1;	/* patch 0035: default 1 */
++module_param(start_sensor, uint, 0444);
++MODULE_PARM_DESC(start_sensor,
++		 "EXPERIMENT: start the OV13B via ov13b10 s_stream: 0 off, 1 after START_STREAM is queued, 2 before");
++
++/*
++ * EXPERIMENT (GZ302): the sensor's enable pin is a GPIO of the ISP block (amdisp-pinctrl GPIO 0, mapped as the
++ * ov13b10 "reset" line by an earlier patch) and that block is power-gated when idle.  The sensor was alive at
++ * probe, but the NACKs of findings section 36 suggest the pin state is lost while the ov13b10 driver still
++ * thinks it is powered (runtime status "active").  With sensor_pm_cycle=1 the sensor is forced through its own
++ * runtime suspend and resume once the ISP is up (power_off then power_on of the driver: the reset GPIO is
++ * asserted and released again), before the raw I2C probe and s_stream.  Needs start_sensor != 0.
++ */
++static bool sensor_pm_cycle = true;	/* patch 0035: default on */
++module_param(sensor_pm_cycle, bool, 0444);
++MODULE_PARM_DESC(sensor_pm_cycle,
++		 "EXPERIMENT: force an ov13b10 runtime suspend+resume (re-drives its enable GPIO) before starting it; needs start_sensor");
++
++/*
++ * EXPERIMENT (GZ302, patch 0023): the "enable_isp" GPIO (AMDI0030:00 pin 85, assigned to this board by an earlier
++ * patch only by analogy with the OV05C10 reference platform) goes high when the capture node is opened and low when
++ * it is closed.  The front-camera LED lights during exactly that window (findings sections 50 and 51).  With
++ * skip_enable_gpio=1 the driver never changes the line, which stays low from probe, to see whether the LED still
++ * comes on and whether the ISP still boots without it.
++ */
++static bool skip_enable_gpio;
++module_param(skip_enable_gpio, bool, 0444);
++MODULE_PARM_DESC(skip_enable_gpio,
++		 "EXPERIMENT: never drive the enable_isp GPIO (AMDI0030:00 pin 85); it stays low");
++
++/*
++ * EXPERIMENT (GZ302, patch 0025): the Windows init table programs the OV13B PLL as 0x0303=0x01, 0x0305=0x46,
++ * 0x0325=0x55, which gives 1120 Mbps/lane only from a 24 MHz input clock; the Linux driver programs 0x04/0xaf/0xa4,
++ * which gives 1120 Mbps only from 19.2 MHz (findings section 58).  The ISP firmware and the D-PHY are set up for
++ * 1120 Mbps, and the receiver sees corrupt packet headers.  After a successful s_stream(1):
++ *   sensor_pll=1  read the live PLL/MIPI registers back over raw I2C and log them (no writes)
++ *   sensor_pll=2  read back, then in software standby (0x0100=0) write the Windows PLL values, stream on again
++ *                 (0x0100=1), and read back again
++ *   sensor_pll=3  (patch 0033) as 2, plus the other mode registers where the Windows table differs from the
++ *                 Linux ov13b10 one (findings section 59): above all 0x3813=0x08 (vertical window offset; Linux
++ *                 0x09 shifts the Bayer pattern by one row, suspected cause of the magenta cast, section 88)
++ */
++static unsigned int sensor_pll;	/* patch 0036: default 0, ov13b10 applies the GZ302 values itself (gz302_fixups) */
++module_param(sensor_pll, uint, 0444);
++MODULE_PARM_DESC(sensor_pll,
++		 "EXPERIMENT: after ov13b10 s_stream: 1 log the PLL registers, 2 also apply the Windows (24 MHz) PLL values, 3 also the other Windows mode registers (0x3813=08 ...)");
++
++/*
++ * EXPERIMENT (GZ302, patch 0028): firmware commands that the Windows driver sends for a working preview and the
++ * Linux driver never sends (Windows ETW trace, findings section 71; payloads read from amdcamera.sys, findings 72).
++ * win_cmds is a bit mask, 0 (default) = behave as before:
++ *   0x01 ENABLE_RTA                      {1}                      right after the memory pool
++ *   0x02 APPLY_TUNING_SCENARIO           {0 = SCENARIO_MODE_PREVIEW}  after SET_STREAM_CONFIG
++ *   0x04 SET_OUT_CHAN_FRAME_RATE_RATIO   {channel 0 = preview, ratio 1}  after SET_OUT_CHAN_PROP
++ *   0x08 SET_SCENE_MODE                  {0 = SCENE_MODE_DEFAULT}     after ENABLE_OUT_CHAN
++ *   0x10 SET_FPS_RANGE                   {15000, 30000}           after the META buffers, before the preview buffers
++ *   0x20 SET_ITIME_RANGE                 {40, 66666} (us)         right after SET_FPS_RANGE
++ *   0x40 ENABLE_PREFETCH (GLOBAL, patch 0029) {1, 1, 1}  (INFERRED payload)  after the META buffers, before SET_FPS_RANGE
++ * Not included (payload unknown or does not fit the 48-byte command slot): SET_3A_CONFIG (92 bytes, sent
++ * "indirect" by Windows), power/clock gating (global commands), SET_M2M_CAL_DATA, SET_ADAPTIVE_RTA.
++ */
++#define EXP_CMD_ID_ENABLE_RTA			0x02090008
++#define EXP_CMD_ID_APPLY_TUNING_SCENARIO	0x02050009
++#define EXP_CMD_ID_SET_OUT_CHAN_FRAME_RATE_RATIO 0x02010004
++#define EXP_CMD_ID_SET_SCENE_MODE		0x02020007
++#define EXP_CMD_ID_SET_FPS_RANGE		0x02020008
++#define EXP_CMD_ID_SET_ITIME_RANGE		0x02020009
++#define EXP_CMD_ID_ENABLE_PREFETCH		0x01030003	/* type 0x01 = global: goes to the global ring */
++
++#define EXP_WIN_RTA		0x01
++#define EXP_WIN_TUNING_SCENARIO	0x02
++#define EXP_WIN_RATE_RATIO	0x04
++#define EXP_WIN_SCENE_MODE	0x08
++#define EXP_WIN_FPS_RANGE	0x10
++#define EXP_WIN_ITIME_RANGE	0x20
++#define EXP_WIN_PREFETCH	0x40
++
++static unsigned int win_cmds = 0x77;	/* patch 0035: all but scene mode */
++module_param(win_cmds, uint, 0444);
++MODULE_PARM_DESC(win_cmds,
++		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range, 0x40 global ENABLE_PREFETCH (0 = none)");
++
++/*
++ * EXPERIMENT (GZ302, patch 0030): with {1,1,1} the firmware hangs in MMhubPrefetchSingleStream during
++ * START_STREAM (findings section 80).  prefetch_flags picks the three ENABLE_PREFETCH payload words one bit
++ * each (bit 0 -> word 0, bit 1 -> word 1, bit 2 -> word 2) so the switch that causes the hang can be found.
++ * The firmware logs its reading as "RTPipe MMHub Prefetch", "SoftRTPipe MMHub Prefetch", "Add YUV GAP".
++ * Default 7 = {1,1,1}, the patch 0029 behaviour.  Only used when win_cmds has bit 0x40.
++ */
++static unsigned int prefetch_flags = 1;	/* patch 0035: RT-pipe prefetch only */
++module_param(prefetch_flags, uint, 0444);
++MODULE_PARM_DESC(prefetch_flags,
++		 "EXPERIMENT: ENABLE_PREFETCH payload, bit N -> word N (0..2), default 7 = {1,1,1}; needs win_cmds bit 0x40");
++
++/* Send one of the Windows-only commands if its bit is set; never fails the bring-up, only logs the result. */
++static void isp4sd_exp_win_cmd(struct isp4_subdev *isp_subdev, unsigned int bit, u32 cmd_id,
++			       const char *name, const u32 *words, u32 count)
++{
++	int ret;
++
++	if (!(win_cmds & bit))
++		return;
++
++	ret = isp4if_send_command(&isp_subdev->ispif, cmd_id, words, count * sizeof(u32));
++	dev_info(isp_subdev->dev, "EXP-WINCMD: %s (0x%08x) %u payload words %*ph -> ret %d\n",
++		 name, cmd_id, count, (int)(count * sizeof(u32)), words, ret);
++}
++
++static struct device *exp_sensor_dev;		/* reference held while the sensor streams */
++static struct v4l2_subdev *exp_sensor_sd;
++
++/*
++ * The ov13b10 driver turns every I2C failure into -EIO (findings section 34).  Do the two
++ * transfers itself, directly on the adapter, and log the real return values:
++ *   - read of the 24-bit chip ID at register 0x300a (expect 56 0d 42)
++ *   - write of 0x00 to register 0x0100 (MODE_SELECT = standby: harmless)
++ * i2c_transfer() returns the number of messages done, or a negative errno (-ENXIO no
++ * acknowledge, -ETIMEDOUT bus timeout, -EAGAIN arbitration lost, -EREMOTEIO ...).
++ */
++static void isp4sd_exp_i2c_probe(struct device *dev, struct i2c_client *client, const char *when)
++{
++	u8 rd_reg[2] = { 0x30, 0x0a };
++	u8 id[3] = { 0, 0, 0 };
++	u8 wr_buf[3] = { 0x01, 0x00, 0x00 };
++	struct i2c_msg rd[2] = {
++		{ .addr = client->addr, .flags = 0, .len = sizeof(rd_reg), .buf = rd_reg },
++		{ .addr = client->addr, .flags = I2C_M_RD, .len = sizeof(id), .buf = id },
++	};
++	struct i2c_msg wr = { .addr = client->addr, .flags = 0, .len = sizeof(wr_buf), .buf = wr_buf };
++	int r_rd, r_wr;
++
++	r_rd = i2c_transfer(client->adapter, rd, 2);
++	r_wr = i2c_transfer(client->adapter, &wr, 1);
++
++	dev_info(dev,
++		 "EXP-SENSOR: raw I2C (%s) adapter %s addr 0x%02x: chip-id read ret %d (id %02x %02x %02x, want 56 0d 42), write 0x0100=0 ret %d, sensor runtime-active %d\n",
++		 when, client->adapter->name, client->addr, r_rd, id[0], id[1], id[2], r_wr,
++		 pm_runtime_active(&client->dev));
++}
++
++/* patch 0025: one 8-bit register of the sensor over raw I2C (16-bit big-endian register address) */
++static int isp4sd_exp_rd8(struct i2c_client *client, u16 reg, u8 *val)
++{
++	u8 addr[2] = { reg >> 8, reg & 0xff };
++	struct i2c_msg msg[2] = {
++		{ .addr = client->addr, .flags = 0, .len = sizeof(addr), .buf = addr },
++		{ .addr = client->addr, .flags = I2C_M_RD, .len = 1, .buf = val },
++	};
++	int ret = i2c_transfer(client->adapter, msg, 2);
++
++	return ret == 2 ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++static int isp4sd_exp_wr8(struct i2c_client *client, u16 reg, u8 val)
++{
++	u8 buf[3] = { reg >> 8, reg & 0xff, val };
++	struct i2c_msg msg = { .addr = client->addr, .flags = 0, .len = sizeof(buf), .buf = buf };
++	int ret = i2c_transfer(client->adapter, &msg, 1);
++
++	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
++}
++
++/* PLL, stream and MIPI timing registers that differ or matter between the Windows and Linux tables */
++static const u16 exp_pll_regs[] = {
++	0x0100, 0x0303, 0x0305, 0x0321, 0x0323, 0x0324, 0x0325, 0x0326, 0x0327, 0x3011, 0x4800, 0x4837,
++	0x3600, 0x380f, 0x3813, 0x3774, 0x3823, 0x3827,	/* patch 0033: mode registers of sensor_pll=3 */
++};
++
++static void isp4sd_exp_pll_dump(struct device *dev, struct i2c_client *client, const char *when)
++{
++	char line[256];
++	int n = 0;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(exp_pll_regs); i++) {
++		u8 v = 0;
++		int r = isp4sd_exp_rd8(client, exp_pll_regs[i], &v);
++
++		if (r)
++			n += scnprintf(line + n, sizeof(line) - n, " 0x%04x=ERR%d", exp_pll_regs[i], r);
++		else
++			n += scnprintf(line + n, sizeof(line) - n, " 0x%04x=%02x", exp_pll_regs[i], v);
++	}
++	dev_info(dev, "EXP-SENSOR: PLL regs (%s):%s\n", when, line);
++}
++
++/*
++ * Windows PLL values (findings section 3 table, section 58).  Software standby first: an OmniVision sensor
++ * should not change its PLL while streaming.  Returns the first I2C error or 0.
++ */
++static int isp4sd_exp_pll_apply_windows(struct device *dev, struct i2c_client *client)
++{
++	static const struct { u16 reg; u8 val; } seq[] = {
++		{ 0x0100, 0x00 },	/* software standby */
++		{ 0x0303, 0x01 },
++		{ 0x0305, 0x46 },
++		{ 0x0325, 0x55 },
++	};
++	int ret;
++
++	for (unsigned int i = 0; i < ARRAY_SIZE(seq); i++) {
++		ret = isp4sd_exp_wr8(client, seq[i].reg, seq[i].val);
++		if (ret) {
++			dev_err(dev, "EXP-SENSOR: PLL write 0x%04x=0x%02x failed: %d\n", seq[i].reg, seq[i].val, ret);
++			return ret;
++		}
++		if (i == 0)
++			usleep_range(5000, 6000);	/* let the current frame end before touching the PLL */
++	}
++	if (sensor_pll >= 3) {
++		/*
++		 * patch 0033: Windows mode values that differ from the Linux table (section 59), still in standby.
++		 * Exposure/gain registers (0x3501/0x3502/0x3508/0x3509) are left out: the firmware's AE writes them.
++		 */
++		static const struct { u16 reg; u8 val; } mode[] = {
++			{ 0x3813, 0x08 },	/* vertical window offset (Linux 0x09): Bayer phase */
++			{ 0x3600, 0x1a },	/* analog (Linux 0x16) */
++			{ 0x380f, 0x94 },	/* frame length low byte, 0x0c94 = 3220 lines (Linux 0x7c) */
++			{ 0x3011, 0x7c },	/* only in the Windows table */
++			{ 0x3774, 0x2d },	/* only in the Windows table */
++			{ 0x3823, 0x18 },	/* only in the Windows table */
++			{ 0x3827, 0x01 },	/* only in the Windows table */
++		};
++
++		for (unsigned int i = 0; i < ARRAY_SIZE(mode); i++) {
++			ret = isp4sd_exp_wr8(client, mode[i].reg, mode[i].val);
++			if (ret) {
++				dev_err(dev, "EXP-SENSOR: mode write 0x%04x=0x%02x failed: %d\n",
++					mode[i].reg, mode[i].val, ret);
++				return ret;
++			}
++		}
++		dev_info(dev, "EXP-SENSOR: applied the Windows mode registers (0x3813=08 0x3600=1a 0x380f=94 0x3011=7c 0x3774=2d 0x3823=18 0x3827=01)\n");
++	}
++	usleep_range(5000, 6000);		/* PLL lock */
++	ret = isp4sd_exp_wr8(client, 0x0100, 0x01);	/* stream on */
++	dev_info(dev, "EXP-SENSOR: applied the Windows PLL values (0x0303=01 0x0305=46 0x0325=55), stream on -> %d\n", ret);
++	return ret;
++}
++
++/*
++ * EXPERIMENT (GZ302, patch 0026): safety limit for live tests.  With the Windows PLL the CSI-2 data decodes, the
++ * ISP's MIPI write DMA overflows (INTR_LATENCY_BUFFER_LEAKING, ~110 ms after START_STREAM) and ~2 s later the ISP
++ * firmware and the SMU hang, freezing the machine (findings sections 59/60).  With sensor_burst_ms=N the sensor is
++ * put into software standby (0x0100=0, raw I2C) N ms after it started streaming, so the data flood ends early.
++ * Use it with start_sensor=1 (sensor started after START_STREAM is queued): with start_sensor=2 and phy_init the
++ * sensor starts ~1.1 s before START_STREAM and the burst would end before the pipeline runs.
++ */
++static unsigned int sensor_burst_ms;
++module_param(sensor_burst_ms, uint, 0444);
++MODULE_PARM_DESC(sensor_burst_ms,
++		 "EXPERIMENT: put the sensor into software standby N ms after it started streaming (0 = off; use with start_sensor=1)");
++
++static struct i2c_client *exp_burst_client;	/* sensor to stop, set while the work is armed */
++static struct device *exp_burst_log_dev;
++
++static void isp4sd_exp_burst_fn(struct work_struct *work)
++{
++	int ret = exp_burst_client ? isp4sd_exp_wr8(exp_burst_client, 0x0100, 0x00) : -ENODEV;
++
++	if (exp_burst_log_dev)
++		dev_info(exp_burst_log_dev, "EXP-SENSOR: burst limit: sensor put into software standby after %u ms -> %d\n",
++			 sensor_burst_ms, ret);
++}
++
++static DECLARE_DELAYED_WORK(exp_burst_work, isp4sd_exp_burst_fn);
++
++/*
++ * EXPERIMENT (GZ302, patch 0034, tuning step 4): the D-PHY diagnostics of patch 0022 sleep 1.1 s inside
++ * the buffer-send path (start_streaming), during which the host cannot queue buffers and frames are
++ * dropped ("Preview buffer is not available").  phy_diag=0 skips them.  Default 1 = as before.
++ */
++static bool phy_diag;	/* patch 0035: default off (no sleeps in the send path) */
++module_param(phy_diag, bool, 0444);
++MODULE_PARM_DESC(phy_diag, "EXPERIMENT: D-PHY state dumps (+100 ms, +1 s) after the sensor starts; 0 skips the 1.1 s of sleeps");
++
++static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *ispif, const char *when)
++{
++	struct device *sdev;
++	struct i2c_client *client;
++	struct v4l2_subdev *sd;
++	int ret;
++	int pm_ref = -1;
++
++	if (!start_sensor || exp_sensor_dev)
++		return;
++
++	sdev = bus_find_device_by_name(&i2c_bus_type, NULL, EXP_SENSOR_I2C_NAME);
++	if (!sdev) {
++		dev_err(dev, "EXP-SENSOR: no I2C device %s\n", EXP_SENSOR_I2C_NAME);
++		return;
++	}
++
++	client = i2c_verify_client(sdev);
++	sd = client ? i2c_get_clientdata(client) : NULL;
++	if (!sd) {
++		dev_err(dev, "EXP-SENSOR: %s has no subdev in its client data (driver not bound?)\n",
++			EXP_SENSOR_I2C_NAME);
++		put_device(sdev);
++		return;
++	}
++
++	if (sensor_pm_cycle) {
++		int r_susp, r_res;
++
++		isp4sd_exp_i2c_probe(dev, client, "before pm cycle");
++		r_susp = pm_runtime_force_suspend(&client->dev);
++		r_res = pm_runtime_force_resume(&client->dev);
++		dev_info(dev, "EXP-SENSOR: forced runtime PM cycle of the sensor: suspend %d, resume %d, runtime-active %d\n",
++			 r_susp, r_res, pm_runtime_active(&client->dev));
++		isp4sd_exp_i2c_probe(dev, client, "after pm cycle");
++	}
++
++	isp4sd_exp_i2c_probe(dev, client, "before s_stream");
++
++	/*
++	 * Windows starts the D-PHY receiver with the sensor powered and before the sensor streams.  Hold a
++	 * runtime-PM reference on the sensor across the PHY start and s_stream, so it is not powered down in between.
++	 */
++	if (isp4if_phy_init_enabled()) {
++		pm_ref = pm_runtime_resume_and_get(&client->dev);
++		dev_info(dev, "EXP-SENSOR: powered the sensor for the PHY start: %d\n", pm_ref);
++		ret = isp4if_phy_init(ispif);
++		dev_info(dev, "EXP-SENSOR: PHY start returned %d\n", ret);
++	}
++
++	ret = v4l2_subdev_call(sd, video, s_stream, 1);
++	dev_info(dev, "EXP-SENSOR: %s s_stream(1) %s START_STREAM -> %d\n", sd->name, when, ret);
++	if (!ret && sensor_pll) {
++		/* patch 0025: what the sensor really got, and optionally the Windows PLL values */
++		isp4sd_exp_pll_dump(dev, client, "after s_stream");
++		if (sensor_pll >= 2 && !isp4sd_exp_pll_apply_windows(dev, client))
++			isp4sd_exp_pll_dump(dev, client, "after Windows PLL");
++	}
++	if (!ret && sensor_burst_ms) {
++		/* patch 0026: end the sensor's output after a short burst (runs from a workqueue) */
++		exp_burst_client = client;
++		exp_burst_log_dev = dev;
++		schedule_delayed_work(&exp_burst_work, msecs_to_jiffies(sensor_burst_ms));
++		dev_info(dev, "EXP-SENSOR: burst limit armed: sensor standby in %u ms\n", sensor_burst_ms);
++	}
++	if (!ret && isp4if_phy_init_enabled() && phy_diag) {	/* patch 0034: phy_diag=0 skips the sleeps */
++		/* patch 0022: D-PHY state right after, 100 ms and 1 s after the sensor started streaming */
++		isp4if_phy_diag(ispif, "after s_stream");
++		msleep(100);
++		isp4if_phy_diag(ispif, "+100ms");
++		msleep(900);
++		isp4if_phy_diag(ispif, "+1s");
++	}
++	if (pm_ref >= 0)
++		pm_runtime_put(&client->dev);
++	if (ret) {
++		isp4sd_exp_i2c_probe(dev, client, "after failed s_stream");
++		put_device(sdev);
++		return;
++	}
++
++	exp_sensor_dev = sdev;
++	exp_sensor_sd = sd;
++}
++
++static void isp4sd_exp_sensor_stop(struct device *dev)
++{
++	int ret;
++
++	/* patch 0026: the burst work must not run on a sensor that is being stopped */
++	cancel_delayed_work_sync(&exp_burst_work);
++	exp_burst_client = NULL;
++
++	if (!exp_sensor_dev)
++		return;
++
++	ret = v4l2_subdev_call(exp_sensor_sd, video, s_stream, 0);
++	dev_info(dev, "EXP-SENSOR: %s s_stream(0) -> %d\n", exp_sensor_sd->name, ret);
++	put_device(exp_sensor_dev);
++	exp_sensor_dev = NULL;
++	exp_sensor_sd = NULL;
++}
++
+ #define ISP4SD_PERFORMANCE_STATE_LOW 0
+ #define ISP4SD_PERFORMANCE_STATE_HIGH 1
+ 
+ /* align 32KB */
+ #define ISP4SD_META_BUF_SIZE ALIGN(sizeof(struct isp4fw_meta_info), 0x8000)
+ 
++/*
++ * EXPERIMENT (GZ302, patch 0027): the ISP firmware asks the host for four buffers of type 13 every time a stream
++ * is set up (BUF_MGR "PopFrontBuffer: BUF|queue empty:type=13"), and the Linux driver never sends any.  type 13 =
++ * BUFFER_TYPE_META_DATA in the Windows driver (findings section 65).  Windows (isp_send_metadata_buf) allocates 6
++ * buffers of 0x20000 bytes, NOT cleared, and sends them with SEND_BUFFER right before the 6 META_INFO (type 10)
++ * buffers, vmid_space space = 4, before START_STREAM.  meta_data_bufs=N sends N of them (0 = off, max 6).
++ */
++#define EXP_BUFFER_TYPE_META_DATA	13
++#define EXP_META_DATA_BUF_SIZE		0x20000
++#define EXP_META_DATA_BUF_MAX		6
++
++static unsigned int meta_data_bufs = 6;	/* patch 0035: like Windows */
++module_param(meta_data_bufs, uint, 0444);
++MODULE_PARM_DESC(meta_data_bufs,
++		 "EXPERIMENT: send N (max 6) type-13 META_DATA buffers of 128 KiB before START_STREAM, like Windows (0 = off)");
++
++struct exp_meta_data_buf {
++	void *handle;
++	u64 gpu_addr;
++	void *cpu_addr;
++};
++
++static struct exp_meta_data_buf exp_meta_data[EXP_META_DATA_BUF_MAX];
++static unsigned int exp_meta_data_cnt;
++
++/*
++ * EXPERIMENT (GZ302, patch 0034, tuning step 2): the firmware takes one META_DATA buffer per frame
++ * ("LoadFrameMetaData: No meta data buffer is available" once per frame after the first 6) and the
++ * Linux driver never gives them back.  Windows re-sends a META_INFO + META_DATA pair after every
++ * frame-done (ResendMetaInFrameDone, same index for both).  The frame-done meta info does not say
++ * which META_DATA buffer was used, so they are re-sent round-robin in submission order (INFERENCE:
++ * the firmware consumes them in order, one per frame).  Needs meta_data_bufs.
++ */
++static bool meta_data_resend = true;	/* patch 0035: default on */
++module_param(meta_data_resend, bool, 0444);
++MODULE_PARM_DESC(meta_data_resend,
++		 "EXPERIMENT: re-send one type-13 META_DATA buffer (round-robin) after every frame-done, like Windows");
++
++static unsigned int exp_meta_data_next;	/* next META_DATA buffer to re-send */
++
++static void isp4sd_exp_meta_data_free(void)
++{
++	for (unsigned int i = 0; i < exp_meta_data_cnt; i++)
++		isp_kernel_buffer_free(&exp_meta_data[i].handle, &exp_meta_data[i].gpu_addr,
++				       &exp_meta_data[i].cpu_addr);
++	exp_meta_data_cnt = 0;
++}
++
+ #define to_isp4_subdev(sd) container_of(sd, struct isp4_subdev, sdev)
+ 
+ static const char *isp4sd_entity_name = "amd isp4";
+@@ -30,6 +481,11 @@
+ 
+ static void isp4sd_module_enable(struct isp4_subdev *isp_subdev, bool enable)
+ {
++	if (skip_enable_gpio) {
++		dev_info_once(isp_subdev->dev, "EXP: skip_enable_gpio=1, enable_isp GPIO is not driven\n");
++		return;
++	}
++
+ 	if (isp_subdev->enable_gpio) {
+ 		gpiod_set_value(isp_subdev->enable_gpio, enable ? 1 : 0);
+ 		dev_dbg(isp_subdev->dev, "%s isp_subdev module\n",
+@@ -117,6 +573,41 @@
+ 	 * compilers.
+ 	 */
+ 	memset(&buf_type, 0, sizeof(buf_type));
++
++	/* patch 0027: type-13 META_DATA buffers first, as Windows does (allocated once, kept until module unload) */
++	if (meta_data_bufs) {
++		unsigned int want = min_t(unsigned int, meta_data_bufs, EXP_META_DATA_BUF_MAX);
++
++		while (exp_meta_data_cnt < want) {
++			struct exp_meta_data_buf *b = &exp_meta_data[exp_meta_data_cnt];
++			int ret = isp_kernel_buffer_alloc(dev, EXP_META_DATA_BUF_SIZE, &b->handle, &b->gpu_addr,
++							  &b->cpu_addr);
++
++			if (ret) {
++				dev_err(dev, "EXP: alloc of type-13 buffer %u failed: %d\n", exp_meta_data_cnt, ret);
++				return ret;
++			}
++			exp_meta_data_cnt++;
++		}
++		for (unsigned int i = 0; i < want; i++) {
++			int ret;
++
++			buf_type.buffer_type = EXP_BUFFER_TYPE_META_DATA;
++			buf_type.buffer.vmid_space.bit.space = ISP4FW_ADDR_SPACE_TYPE_GPU_VA;
++			isp4if_split_addr64(exp_meta_data[i].gpu_addr, &buf_type.buffer.buf_base_a_lo,
++					    &buf_type.buffer.buf_base_a_hi);
++			buf_type.buffer.buf_size_a = EXP_META_DATA_BUF_SIZE;
++			ret = isp4if_send_command(ispif, ISP4FW_CMD_ID_SEND_BUFFER, &buf_type, sizeof(buf_type));
++			if (ret) {
++				dev_err(dev, "EXP: send type-13 buffer %u failed: %d\n", i, ret);
++				return ret;
++			}
++		}
++		dev_info(dev, "EXP: sent %u type-13 META_DATA buffers of 0x%x bytes\n", want, EXP_META_DATA_BUF_SIZE);
++		exp_meta_data_next = 0;		/* patch 0034: round-robin re-send starts at the first buffer */
++		memset(&buf_type, 0, sizeof(buf_type));
++	}
++
+ 	for (unsigned int i = 0; i < ISP4IF_MAX_STREAM_BUF_COUNT; i++) {
+ 		struct isp4if_gpu_mem_info *meta_info_buf =
+ 				isp_subdev->ispif.meta_info_buf[i];
+@@ -208,18 +699,40 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/* EXPERIMENT (patch 0029): Windows enables MMHUB prefetch (global command) before the fps range */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_PREFETCH, EXP_CMD_ID_ENABLE_PREFETCH, "ENABLE_PREFETCH",
++			   (const u32 []){ prefetch_flags & 1, (prefetch_flags >> 1) & 1,
++					   (prefetch_flags >> 2) & 1 }, 3);	/* patch 0030 */
++
++	/* EXPERIMENT (patch 0028): Windows sends the fps and integration time ranges after the META buffers */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_FPS_RANGE, EXP_CMD_ID_SET_FPS_RANGE,
++			   "SET_FPS_RANGE", (const u32 []){ 15000, 30000 }, 2);
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_ITIME_RANGE, EXP_CMD_ID_SET_ITIME_RANGE,
++			   "SET_ITIME_RANGE", (const u32 []){ 40, 66666 }, 2);
++
+ 	sensor_info->status = ISP4SD_START_STATUS_OFF;
+ 
+ 	if (!sensor_info->start_stream_cmd_sent &&
+-	    sensor_info->buf_sent_cnt >= ISP4SD_MIN_BUF_CNT_BEF_START_STREAM) {
+-		int ret = isp4if_send_command(ispif, ISP4FW_CMD_ID_START_STREAM,
+-					      NULL, 0);
++	    sensor_info->buf_sent_cnt >= min_start_bufs) {
++		int ret;
++
++		if (start_sensor == 2)
++			isp4sd_exp_sensor_start(dev, ispif, "before");
++
++		ret = isp4if_send_command(ispif, ISP4FW_CMD_ID_START_STREAM,
++					  NULL, 0);
+ 		if (ret) {
+-			dev_err(dev, "fail to start stream\n");
++			dev_err(dev, "EXP: START_STREAM failed (kickoff), ret %d, buf_sent %u, min %u\n",
++				ret, sensor_info->buf_sent_cnt, min_start_bufs);
+ 			return ret;
+ 		}
+ 
++		dev_info(dev, "EXP: START_STREAM queued to fw (kickoff), buf_sent %u, min %u\n",
++			 sensor_info->buf_sent_cnt, min_start_bufs);
++		isp4if_dump_rings(ispif, "after START_STREAM queued (kickoff)");
+ 		sensor_info->start_stream_cmd_sent = true;
++		if (start_sensor == 1)
++			isp4sd_exp_sensor_start(dev, ispif, "after");
+ 	} else {
+ 		dev_dbg(dev,
+ 			"no send START_STREAM, start_sent %u, buf_sent %u\n",
+@@ -279,6 +792,10 @@
+ 		return ret;
+ 	}
+ 
++	/* EXPERIMENT (patch 0028): Windows sends the frame rate ratio {channel, 1} between PROP and ENABLE */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_RATE_RATIO, EXP_CMD_ID_SET_OUT_CHAN_FRAME_RATE_RATIO,
++			   "SET_OUT_CHAN_FRAME_RATE_RATIO", (const u32 []){ cmd_ch_prop.ch, 1 }, 2);
++
+ 	/*
+ 	 * The struct will be shared with ISP FW, use memset() to guarantee
+ 	 * padding bits are zeroed, since this is not guaranteed on all
+@@ -298,6 +815,10 @@
+ 	dev_dbg(dev, "enable channel %s\n",
+ 		isp4dbg_get_out_ch_str(cmd_ch_en.ch));
+ 
++	/* EXPERIMENT (patch 0028): Windows sets the AE scene mode (0 = DEFAULT) right after ENABLE_OUT_CHAN */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_SCENE_MODE, EXP_CMD_ID_SET_SCENE_MODE,
++			   "SET_SCENE_MODE", (const u32 []){ 0 }, 1);
++
+ 	if (!sensor_info->start_stream_cmd_sent) {
+ 		ret = isp4sd_kickoff_stream(isp_subdev,
+ 					    cmd_ch_prop.image_prop.width,
+@@ -339,12 +860,23 @@
+ 		return ret;
+ 	}
+ 
++	/* EXPERIMENT (patch 0028): Windows sends ENABLE_RTA right after the memory pool */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_RTA, EXP_CMD_ID_ENABLE_RTA, "ENABLE_RTA",
++			   (const u32 []){ 1 }, 1);
++
++	/* EXPERIMENT (GZ302): Windows sends the sensor setup here, before the stream config */
++	isp4if_replay_sensor_setup(&isp_subdev->ispif);
++
+ 	ret = isp4sd_set_stream_path(isp_subdev);
+ 	if (ret) {
+ 		dev_err(dev, "fail to setup stream path\n");
+ 		return ret;
+ 	}
+ 
++	/* EXPERIMENT (patch 0028): Windows then selects the tuning scenario (0 = preview) */
++	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_TUNING_SCENARIO, EXP_CMD_ID_APPLY_TUNING_SCENARIO,
++			   "APPLY_TUNING_SCENARIO", (const u32 []){ 0 }, 1);
++
+ 	return 0;
+ }
+ 
+@@ -356,6 +888,8 @@
+ 	struct isp4_interface *ispif = &isp_subdev->ispif;
+ 	struct v4l2_mbus_framefmt *format;
+ 
++	isp4sd_exp_sensor_stop(isp_subdev->dev);	/* EXPERIMENT: no-op unless start_sensor started it */
++
+ 	format = v4l2_subdev_state_get_format(state, pad, 0);
+ 	if (!format) {
+ 		dev_err(isp_subdev->dev, "fail to get v4l2 format\n");
+@@ -389,6 +923,11 @@
+ 		para->cmd_id, para->cmd_status, para->cmd_seq_num,
+ 		ele);
+ 
++	/* EXPERIMENT (GZ302): always show the firmware's verdict, error code and 36-byte payload */
++	dev_info(dev, "EXP-RESP: seq %u cmd 0x%08x status %u (0 ok, 1 fail, 2 skipped) fw_error_code 0x%04x payload %36ph\n",
++		 para->cmd_seq_num, para->cmd_id, para->cmd_status,
++		 para->isp4fw_error_code, para->payload);
++
+ 	if (ele) {
+ 		complete(&ele->cmd_done);
+ 		if (refcount_dec_and_test(&ele->refcnt))
+@@ -489,6 +1028,23 @@
+ 	if (isp_subdev->sensor_info.status == ISP4SD_START_STATUS_STARTED)
+ 		isp4sd_send_meta_info(isp_subdev, mc);
+ 
++	/* patch 0034: give one META_DATA buffer back per frame, like Windows' ResendMetaInFrameDone */
++	if (meta_data_resend && exp_meta_data_cnt &&
++	    isp_subdev->sensor_info.status == ISP4SD_START_STATUS_STARTED) {
++		struct exp_meta_data_buf *b = &exp_meta_data[exp_meta_data_next % exp_meta_data_cnt];
++		struct isp4fw_cmd_send_buffer md;
++
++		memset(&md, 0, sizeof(md));
++		md.buffer_type = EXP_BUFFER_TYPE_META_DATA;
++		md.buffer.vmid_space.bit.space = ISP4FW_ADDR_SPACE_TYPE_GPU_VA;
++		isp4if_split_addr64(b->gpu_addr, &md.buffer.buf_base_a_lo, &md.buffer.buf_base_a_hi);
++		md.buffer.buf_size_a = EXP_META_DATA_BUF_SIZE;
++		if (isp4if_send_command(ispif, ISP4FW_CMD_ID_SEND_BUFFER, &md, sizeof(md)))
++			dev_err(dev, "EXP: re-send of META_DATA %u failed\n",
++				exp_meta_data_next % exp_meta_data_cnt);
++		exp_meta_data_next++;
++	}
++
+ 	dev_dbg(dev, "stream_id:%d, status:%d\n", stream_id,
+ 		isp_subdev->sensor_info.status);
+ }
+@@ -872,24 +1428,34 @@
+ 	if (!isp_subdev->sensor_info.start_stream_cmd_sent) {
+ 		isp_subdev->sensor_info.buf_sent_cnt++;
+ 
+-		if (isp_subdev->sensor_info.buf_sent_cnt >=
+-		    ISP4SD_MIN_BUF_CNT_BEF_START_STREAM) {
++		if (isp_subdev->sensor_info.buf_sent_cnt >= min_start_bufs) {
++			if (start_sensor == 2)
++				isp4sd_exp_sensor_start(dev, ispif, "before");
++
+ 			ret = isp4if_send_command(ispif,
+ 						  ISP4FW_CMD_ID_START_STREAM,
+ 						  NULL, 0);
+ 			if (ret) {
+-				dev_err(dev, "fail to START_STREAM");
++				dev_err(dev, "EXP: START_STREAM failed (img buf), ret %d, buf_sent %u, min %u\n",
++					ret, isp_subdev->sensor_info.buf_sent_cnt,
++					min_start_bufs);
+ 				goto error_release_buf_node;
+ 			}
++			dev_info(dev, "EXP: START_STREAM queued to fw (img buf), buf_sent %u, min %u\n",
++				 isp_subdev->sensor_info.buf_sent_cnt,
++				 min_start_bufs);
++			isp4if_dump_rings(ispif, "after START_STREAM queued (img buf)");
+ 			isp_subdev->sensor_info.start_stream_cmd_sent = true;
+ 			isp_subdev->sensor_info.output_info.start_status =
+ 				ISP4SD_START_STATUS_STARTED;
+ 			isp_subdev->sensor_info.status =
+ 				ISP4SD_START_STATUS_STARTED;
++			if (start_sensor == 1)
++				isp4sd_exp_sensor_start(dev, ispif, "after");
+ 		} else {
+ 			dev_dbg(dev,
+ 				"no send start, required %u, buf sent %u\n",
+-				ISP4SD_MIN_BUF_CNT_BEF_START_STREAM,
++				min_start_bufs,
+ 				isp_subdev->sensor_info.buf_sent_cnt);
+ 		}
+ 	}
+@@ -1053,6 +1619,11 @@
+ {
+ 	struct isp4_interface *ispif = &isp_subdev->ispif;
+ 
++	/* patch 0026: never leave the burst work pending when the module goes away */
++	cancel_delayed_work_sync(&exp_burst_work);
++	exp_burst_client = NULL;
++	isp4sd_exp_meta_data_free();	/* patch 0027 */
++
+ 	isp4vid_dev_deinit(&isp_subdev->isp_vdev);
+ 	v4l2_device_unregister_subdev(&isp_subdev->sdev);
+ 	media_entity_cleanup(&isp_subdev->sdev.entity);
+diff --git a/drivers/media/platform/amd/isp4/isp4_video.c b/drivers/media/platform/amd/isp4/isp4_video.c
+--- a/drivers/media/platform/amd/isp4/isp4_video.c
++++ b/drivers/media/platform/amd/isp4/isp4_video.c
+@@ -532,7 +532,7 @@
+ 					unsigned int count)
+ {
+ 	struct isp4vid_dev *isp_vdev = vb2_get_drv_priv(vq);
+-	struct isp4vid_capture_buffer *isp4vid_buf;
++	struct isp4vid_capture_buffer *isp4vid_buf, *next_buf;
+ 	struct media_entity *entity;
+ 	struct v4l2_subdev *subdev;
+ 	struct media_pad *pad;
+@@ -567,7 +567,15 @@
+ 		}
+ 	}
+ 
+-	list_for_each_entry(isp4vid_buf, &isp_vdev->buf_list, list)
++	/*
++	 * EXPERIMENT (GZ302, patch 0031): the firmware can complete a buffer, and the frame-done path can
++	 * list_del() it from buf_list (under buf_list_lock), while this loop is still inside
++	 * isp4sd_ioc_send_img_buf() for that buffer (START_STREAM and the experimental sensor start run in
++	 * there).  The plain iterator then followed the poisoned ->next and oopsed (findings section 83).
++	 * The _safe iterator reads the next entry before sending the current one; an entry that has not
++	 * been sent yet cannot be completed by the firmware, so it cannot be removed meanwhile.
++	 */
++	list_for_each_entry_safe(isp4vid_buf, next_buf, &isp_vdev->buf_list, list)
+ 		isp4sd_ioc_send_img_buf(isp_vdev->isp_sdev,
+ 					&isp4vid_buf->img_buf);
+ 
+diff --git a/drivers/media/platform/amd/isp4/isp4_debug.h b/drivers/media/platform/amd/isp4/isp4_debug.h
+--- a/drivers/media/platform/amd/isp4/isp4_debug.h
++++ b/drivers/media/platform/amd/isp4/isp4_debug.h
+@@ -17,6 +17,7 @@
+ void isp_debugfs_create(struct isp4_device *isp_dev);
+ void isp_debugfs_remove(struct isp4_device *isp_dev);
+ void isp_fw_log_print(struct isp4_subdev *isp);
++void isp_fw_log_dump(struct isp4_subdev *isp, const char *when);
+ 
+ #else
+ 
+@@ -24,6 +25,7 @@
+ #define isp_debugfs_create(cam) ((void)(cam))
+ #define isp_debugfs_remove(cam) ((void)(cam))
+ #define isp_fw_log_print(isp) ((void)(isp))
++#define isp_fw_log_dump(isp, when) ((void)(isp), (void)(when))
+ 
+ #endif /* CONFIG_DEBUG_FS */
+ 
+diff --git a/drivers/media/platform/amd/isp4/isp4_interface.h b/drivers/media/platform/amd/isp4/isp4_interface.h
+--- a/drivers/media/platform/amd/isp4/isp4_interface.h
++++ b/drivers/media/platform/amd/isp4/isp4_interface.h
+@@ -87,6 +87,9 @@
+ 
+ 	/* ISP fw buffers */
+ 	struct isp4if_gpu_mem_info *fw_log_buf;
++	/* EXPERIMENT (GZ302): firmware-visible copies of the replayed Windows sensor setup */
++	struct isp4if_gpu_mem_info *exp_sensor_script;
++	struct isp4if_gpu_mem_info *exp_sensor_prop;
+ 	struct isp4if_gpu_mem_info *fw_cmd_resp_buf;
+ 	struct isp4if_gpu_mem_info *fw_mem_pool;
+ 	struct isp4if_gpu_mem_info *meta_info_buf[ISP4IF_MAX_STREAM_BUF_COUNT];
+@@ -109,6 +112,18 @@
+ int isp4if_f2h_resp(struct isp4_interface *ispif, enum isp4if_stream_id stream,
+ 		    struct isp4fw_resp *resp);
+ 
++/* EXPERIMENT (GZ302 bring-up): log ring-buffer and interrupt state, see isp4_interface.c */
++void isp4if_dump_rings(struct isp4_interface *ispif, const char *when);
++
++/* EXPERIMENT (GZ302 bring-up): host-side MIPI D-PHY receiver start like Windows, no-op unless phy_init=1 */
++bool isp4if_phy_init_enabled(void);
++int isp4if_phy_init(struct isp4_interface *ispif);
++/* EXPERIMENT (patch 0022): read-only D-PHY state snapshot, no-op unless phy_init=1 */
++void isp4if_phy_diag(struct isp4_interface *ispif, const char *label);
++
++/* EXPERIMENT (GZ302 bring-up): replay of the Windows sensor setup, no-op unless replay_sensor_setup=1 */
++int isp4if_replay_sensor_setup(struct isp4_interface *ispif);
++
+ int isp4if_send_command(struct isp4_interface *ispif, u32 cmd_id,
+ 			const void *package, u32 package_size);
+ 

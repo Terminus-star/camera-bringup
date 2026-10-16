@@ -18,7 +18,7 @@ The tool works read-only on its inputs and writes only into --out-dir (must not 
 Do not redistribute the output: it contains the Windows firmware.
 
 Usage (pass paths as arguments; run isolated):
-    python3 -I tools/build_winfw.py --linux-fw FILE --windows-dir DIR --out-dir NEWDIR
+    python3 -I tools/build_winfw.py --linux-fw FILE --windows-dir DIR --out-dir NEWDIR [--tag srx_h]
     python3 -I tools/build_winfw.py --linux-fw FILE --check        # only verify the crc32 rule on the stock image
 """
 
@@ -84,6 +84,8 @@ def main():
     ap.add_argument("--windows-dir", help="directory with the srx_*_isp_firmware_signed.ram files")
     ap.add_argument("--out-dir", help="new directory for the test images")
     ap.add_argument("--check", action="store_true", help="only verify the header rules on the stock image")
+    ap.add_argument("--tag", action="append", choices=("srx", "srx_h"),
+                    help="build only this image (repeatable; default: both). The GZ302 uses srx_h.")
     a = ap.parse_args()
 
     stock = read_linux_fw(a.linux_fw)
@@ -103,7 +105,7 @@ def main():
 
     os.makedirs(a.out_dir, exist_ok=False)        # refuse to reuse an existing directory
     lines = []
-    for tag in ("srx", "srx_h"):
+    for tag in (a.tag or ("srx", "srx_h")):
         src = os.path.join(a.windows_dir, "%s_isp_firmware_signed.ram" % tag)
         with open(src, "rb") as f:
             ram = f.read()
