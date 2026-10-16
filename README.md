@@ -132,7 +132,7 @@ hook that reminds you when CachyOS releases a new kernel.
 | [`data/`](data/) | the two data files shipped with the firmware package |
 | [`tools/`](tools/) | firmware/script builders, D-PHY and disassembly helpers, Windows trace decoders |
 | [`scripts/`](scripts/) | build, test and release scripts (each one starts with a comment saying what it does) |
-| [`docs/`](docs/) | [`findings.md`](docs/findings.md) (the full bring-up log), [`upstream-plan.md`](docs/upstream-plan.md), [`learning-notes.md`](docs/learning-notes.md) |
+| [`docs/`](docs/) | [`findings.md`](docs/findings.md) (the full bring-up log), [`upstream-plan.md`](docs/upstream-plan.md) |
 
 ## How it was done
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Build the experimental amd_isp4_capture.ko (START_STREAM buffer-threshold test).
+# Build the experimental amd_isp4_capture.ko from driver/ (the capture driver with all tuning parameters).
 #
-# What it does: compiles driver/ as an out-of-tree module against the
-# kernel headers of the 7.2.0-1.7-cachyos kernel (extracted into scratch/headers-1.7/),
-# so the module's vermagic matches that kernel and NOT the currently running 7.2.9 one.
+# What it does: compiles driver/ as an out-of-tree module against the headers of the RUNNING kernel
+# (/usr/lib/modules/$(uname -r)/build), with the compiler that kernel was built with (clang -> LLVM=1,
+# GCC -> nothing; read from its .config by scripts/kbuild-env.sh). So the module's vermagic matches the
+# kernel you test on. Another kernel: KVER=<release> or KDIR=<build dir> before the command.
 #
 # Nothing is installed or loaded.  Output: driver/amd_isp4_capture.ko
 #
@@ -11,23 +12,20 @@
 set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-kver=7.2.0-1.7-cachyos
-kdir="$project_dir/scratch/headers-1.7/usr/lib/modules/$kver/build"
 src="$project_dir/driver"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-[[ -d $kdir ]] || die "headers not found: $kdir (extract linux-cachyos-headers-7.2.0-1.7 into scratch/headers-1.7/)"
+source "$project_dir/scripts/kbuild-env.sh"	# KVER, KDIR, KMAKE_CC
 [[ -f $src/Kbuild ]] || die "missing $src/Kbuild"
 
-# That kernel was built with clang + ThinLTO (CONFIG_CC_IS_CLANG, CONFIG_LTO_CLANG_THIN),
-# so the module must be built with the LLVM toolchain too (LLVM=1).
+echo "building for $KVER (${KMAKE_CC[*]:-GCC}) with $KDIR"
 # 4 jobs at low priority: the earlier full-kernel builds froze the desktop; this one is small.
-nice -n 15 make -C "$kdir" M="$src" LLVM=1 -j4 modules
+nice -n 15 make -C "$KDIR" M="$src" "${KMAKE_CC[@]}" -j4 modules
 
 ko="$src/amd_isp4_capture.ko"
 [[ -f $ko ]] || die "build finished but $ko was not produced"
 
 printf '\n--- built module ---\n'
 modinfo "$ko" | grep -E '^(filename|vermagic|depends|parm):' || true
-printf '\nExpected vermagic to start with: %s\n' "$kver"
+printf '\nExpected vermagic to start with: %s\n' "$KVER"

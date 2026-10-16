@@ -54,3 +54,6 @@ aur/*/*.tar.gz.asc
 aur/*/PKGBUILD.before-gz302
 # Local clones of the AUR git repositories (scripts/aur-sync.sh)
 aur-git/
+
+# Personal learning notes: kept on this machine only, not published
+docs/learning-notes.md

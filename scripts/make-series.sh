@@ -5,7 +5,8 @@
 #                                         (base = the pristine CachyOS 7.2.0 tree, as a control)
 #
 # Series (applied in this order; later ones may depend on earlier ones):
-#   0001-0005  board enablement, from the CachyOS camera kernel build dir (KDIR below)
+#   0001-0005  board enablement, from kernel/patches/ (already refreshed there; refreshing them again
+#              changes nothing; the hand-made originals lived in the old CachyOS build folder)
 #   0006       ov13b10 GZ302 DMI quirk (sensor/patches/), needs 0004 first
 #   0007       amd_isp4_capture changes 0009-0037 squashed (scripts/make-capture-squash.sh)
 # Left out on purpose: 0006/0007 of the old kernel (force_stream test mode, 24 MHz PLL: replaced by
@@ -20,11 +21,11 @@
 set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-KDIR=/mnt/windows/Users/Termis/linux-cachyos-camera/linux-cachyos
-BASE=$KDIR/cachyos-7.2.0-1
+PATCHES="$project_dir/kernel/patches"
+BASE="$project_dir/kernel/base/cachyos-7.2.0-1"	# pristine CachyOS 7.2.0 files (kernel/base/README.md)
 series="$project_dir/scratch/series/gz302"
 squash="$project_dir/scratch/series/0001-media-amd-isp4-gz302-capture.patch"
-headers="$project_dir/scratch/headers-1.7/usr/lib/modules/$(uname -r)/build"
+source "$project_dir/scripts/kbuild-env.sh"	# KVER, KDIR, KMAKE_CC: headers and compiler for the test builds
 tags=("$@")
 [[ ${#tags[@]} -eq 0 ]] && tags=(base v7.2.9 v7.3-rc6)
 
@@ -68,11 +69,11 @@ for f in drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c drivers/gpu/drm/amd/amdgpu/isp
 	cp "$BASE/$f" "$stage/b/$f"
 done
 
-refresh "$KDIR/0001-drm-amdgpu-recognize-gz302-ov13b10-isp-sensor.patch" 0001-drm-amdgpu-recognize-gz302-ov13b10-isp-sensor.patch
-refresh "$KDIR/0002-platform-amd-isp4-add-gz302-ov13b10-graph.patch" 0002-platform-amd-isp4-add-gz302-ov13b10-graph.patch
-refresh "$KDIR/0003-drm-amdgpu-enable-isp-gpio-on-gz302.patch" 0003-drm-amdgpu-enable-isp-gpio-on-gz302.patch
-refresh "$KDIR/0004-media-ov13b10-add-i2c-device-id.patch" 0004-media-ov13b10-add-i2c-device-id.patch
-refresh "$KDIR/0005-drm-amdgpu-map-gz302-sensor-reset-gpio.patch" 0005-drm-amdgpu-map-gz302-sensor-reset-gpio.patch
+refresh "$PATCHES/0001-drm-amdgpu-recognize-gz302-ov13b10-isp-sensor.patch" 0001-drm-amdgpu-recognize-gz302-ov13b10-isp-sensor.patch
+refresh "$PATCHES/0002-platform-amd-isp4-add-gz302-ov13b10-graph.patch" 0002-platform-amd-isp4-add-gz302-ov13b10-graph.patch
+refresh "$PATCHES/0003-drm-amdgpu-enable-isp-gpio-on-gz302.patch" 0003-drm-amdgpu-enable-isp-gpio-on-gz302.patch
+refresh "$PATCHES/0004-media-ov13b10-add-i2c-device-id.patch" 0004-media-ov13b10-add-i2c-device-id.patch
+refresh "$PATCHES/0005-drm-amdgpu-map-gz302-sensor-reset-gpio.patch" 0005-drm-amdgpu-map-gz302-sensor-reset-gpio.patch
 refresh "$project_dir/sensor/patches/0001-media-ov13b10-gz302-dmi-quirk.patch" 0006-media-ov13b10-gz302-dmi-quirk.patch \
 "From: GZ302 camera enablement <local@termis>
 Subject: [PATCH] media: ov13b10: add GZ302 DMI quirk for PLL and mode registers
@@ -156,7 +157,7 @@ for tag in "${tags[@]}"; do
 		mkdir -p "$bdir"
 		cp "$work/$m.c" "$bdir/"
 		echo "obj-m := $(basename "$m").o" > "$bdir/Kbuild"
-		if nice -n 15 make -s -C "$headers" M="$bdir" LLVM=1 -j4 modules > "$bdir/build.log" 2>&1; then
+		if nice -n 15 make -s -C "$KDIR" M="$bdir" "${KMAKE_CC[@]}" -j4 modules > "$bdir/build.log" 2>&1; then
 			echo "builds:      $(basename "$m").ko"
 		else
 			echo "BUILD FAILS: $(basename "$m") (see $bdir/build.log)"

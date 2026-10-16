@@ -8,7 +8,7 @@
 # Needs: scratch/series/0001-media-amd-isp4-gz302-capture.patch (scripts/make-capture-squash.sh)
 #        scratch/upstream-src/TAG/ (scripts/fetch-upstream-src.sh)
 # Writes only into scratch/series/build-TAG/ (refuses if it exists). The upstream copy is not touched.
-# Caveat: headers are the RUNNING kernel's (7.2.0), so a TAG whose sources need newer kernel APIs
+# Caveat: headers are the RUNNING kernel's (or KVER=/KDIR=), so a TAG whose sources need other kernel APIs
 # can fail here for reasons unrelated to our patch; read the errors before blaming the patch.
 set -euo pipefail
 
@@ -34,8 +34,6 @@ if [[ $mode != --build-only ]]; then
 	cp "$project_dir/driver/Kbuild" "$work/$kpath/Kbuild"
 fi
 
-# Same headers and compiler as scripts/build-isp4-threshold.sh (CachyOS kernels are built with clang).
-kver=$(uname -r)
-kdir="$project_dir/scratch/headers-1.7/usr/lib/modules/$kver/build"
-[[ -d $kdir ]] || { echo "ERROR: headers not found: $kdir" >&2; exit 1; }
-nice -n 15 make -C "$kdir" M="$work/$kpath" LLVM=1 -j4 modules
+# Same headers and compiler as scripts/build-isp4-threshold.sh (scripts/kbuild-env.sh: running kernel).
+source "$project_dir/scripts/kbuild-env.sh"	# KVER, KDIR, KMAKE_CC
+nice -n 15 make -C "$KDIR" M="$work/$kpath" "${KMAKE_CC[@]}" -j4 modules

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# START_STREAM buffer-threshold experiment.  Run AFTER booting the 7.2.0-1.7-cachyos kernel.
+# START_STREAM buffer-threshold experiment.  Runs on any kernel the module was built for (it checks
+# the module's vermagic against the running kernel; build it with ./scripts/build-isp4-threshold.sh).
 #
 # For each value N in --values, it:
 #   1. unloads the stock amd_isp4_capture module (only that module; its dependencies stay loaded),
@@ -82,7 +83,6 @@ set -u -o pipefail
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 ko="$project_dir/driver/amd_isp4_capture.ko"
 results="$project_dir/scratch/isp4-threshold/results"
-want_kver=7.2.0-1.7-cachyos
 values="4 2 1"
 dev=""
 mmap=4
@@ -138,8 +138,10 @@ done
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
-[[ $(uname -r) == "$want_kver" ]] || die "expected kernel $want_kver, running $(uname -r)"
 [[ -f $ko ]] || die "build the module first: ./scripts/build-isp4-threshold.sh"
+# insmod only accepts a module built for the running kernel; say so clearly before unloading anything.
+ko_kver=$(modinfo -F vermagic "$ko" | cut -d' ' -f1)
+[[ $ko_kver == "$(uname -r)" ]] || die "$ko was built for $ko_kver, running $(uname -r): rebuild it with ./scripts/build-isp4-threshold.sh"
 command -v v4l2-ctl >/dev/null || die "v4l2-ctl not found (package v4l-utils)"
 mkdir -p "$results"
 # With the temporary rule of scripts/sudoers-grant-camera-tests.sh `sudo -n -l` succeeds without a password;

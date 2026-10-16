@@ -14,7 +14,7 @@
 set -euo pipefail
 
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-BASE=/mnt/windows/Users/Termis/linux-cachyos-camera/linux-cachyos/cachyos-7.2.0-1
+BASE="$project_dir/kernel/base/cachyos-7.2.0-1"	# pristine files driver/ started from (kernel/base/README.md)
 kpath=drivers/media/platform/amd/isp4
 out_dir="$project_dir/scratch/series"
 out="$out_dir/0001-media-amd-isp4-gz302-capture.patch"
