@@ -1,0 +1,32 @@
+# Everything still in scratch/ is local only: kernel/amdgpu trees, test results,
+# base-00NN snapshots and the Windows-derived data (firmware, disassembly, traces, ACPI dumps).
+scratch/
+
+# Kernel module build output
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.module-common.o
+Module.symvers
+modules.order
+
+# Python byte-code
+__pycache__/
+
+# Generated from Windows driver data (tools/assemble_ov13b.py, tools/build_sensor_prop.py,
+# tools/build_phy_seq.py); needed to build driver/ but kept local
+driver/isp4_ov13b_script.h
+driver/isp4_ov13b_sensor_prop.h
+driver/isp4_phy_seq.h
+
+# ISP firmware images built from the Windows driver's .ram files (AMD proprietary, licence for
+# redistribution unknown). Kept in firmware/ for the scripts; delete these lines only if you are
+# sure you may publish them (a private repo is still a copy on GitHub's servers).
+firmware/*.bin
+firmware/*.cpio
+firmware/stage-*/
+
+# Machine-local boot configuration copies
+limine.conf*
