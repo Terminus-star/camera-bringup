@@ -17,9 +17,9 @@ __pycache__/
 
 # Generated from Windows driver data (tools/assemble_ov13b.py, tools/build_sensor_prop.py,
 # tools/build_phy_seq.py); needed to build driver/ but kept local
-driver/isp4_ov13b_script.h
-driver/isp4_ov13b_sensor_prop.h
-driver/isp4_phy_seq.h
+**/isp4_ov13b_script.h
+**/isp4_ov13b_sensor_prop.h
+**/isp4_phy_seq.h
 
 # ISP firmware images built from the Windows driver's .ram files (AMD proprietary, licence for
 # redistribution unknown). Kept in firmware/ for the scripts; delete these lines only if you are
@@ -30,3 +30,27 @@ firmware/stage-*/
 
 # Machine-local boot configuration copies
 limine.conf*
+
+# DKMS agent's local test folders (contain staged copies of the generated headers and build output)
+dkms/test-build-*/
+dkms/test-missing-headers/
+
+# Kernel builds made by scripts/rebuild-camera-kernel.sh (tarballs, source trees, packages; many GB)
+kernel/build/
+
+# Debug output from camera test runs (kernel logs, captured frames). The debug code itself stays in
+# the patches while the image is still being tuned; only its output is kept local.
+*.log
+*.raw
+*.yuv
+*.y4m
+
+# makepkg leftovers if a package is built inside aur/ (sources, build trees, packages)
+aur/*/src/
+aur/*/pkg/
+aur/*/*.pkg.tar.*
+aur/*/*.tar.gz
+aur/*/*.tar.gz.asc
+aur/*/PKGBUILD.before-gz302
+# Local clones of the AUR git repositories (scripts/aur-sync.sh)
+aur-git/
