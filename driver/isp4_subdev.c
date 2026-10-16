@@ -38,7 +38,7 @@ MODULE_PARM_DESC(min_start_bufs,
  */
 #define EXP_SENSOR_I2C_NAME "i2c-ov13b10"
 
-static unsigned int start_sensor;
+static unsigned int start_sensor = 1;	/* patch 0035: default 1 */
 module_param(start_sensor, uint, 0444);
 MODULE_PARM_DESC(start_sensor,
 		 "EXPERIMENT: start the OV13B via ov13b10 s_stream: 0 off, 1 after START_STREAM is queued, 2 before");
@@ -51,7 +51,7 @@ MODULE_PARM_DESC(start_sensor,
  * runtime suspend and resume once the ISP is up (power_off then power_on of the driver: the reset GPIO is
  * asserted and released again), before the raw I2C probe and s_stream.  Needs start_sensor != 0.
  */
-static bool sensor_pm_cycle;
+static bool sensor_pm_cycle = true;	/* patch 0035: default on */
 module_param(sensor_pm_cycle, bool, 0444);
 MODULE_PARM_DESC(sensor_pm_cycle,
 		 "EXPERIMENT: force an ov13b10 runtime suspend+resume (re-drives its enable GPIO) before starting it; needs start_sensor");
@@ -76,11 +76,14 @@ MODULE_PARM_DESC(skip_enable_gpio,
  *   sensor_pll=1  read the live PLL/MIPI registers back over raw I2C and log them (no writes)
  *   sensor_pll=2  read back, then in software standby (0x0100=0) write the Windows PLL values, stream on again
  *                 (0x0100=1), and read back again
+ *   sensor_pll=3  (patch 0033) as 2, plus the other mode registers where the Windows table differs from the
+ *                 Linux ov13b10 one (findings section 59): above all 0x3813=0x08 (vertical window offset; Linux
+ *                 0x09 shifts the Bayer pattern by one row, suspected cause of the magenta cast, section 88)
  */
-static unsigned int sensor_pll;
+static unsigned int sensor_pll;	/* patch 0036: default 0, ov13b10 applies the GZ302 values itself (gz302_fixups) */
 module_param(sensor_pll, uint, 0444);
 MODULE_PARM_DESC(sensor_pll,
-		 "EXPERIMENT: after ov13b10 s_stream: 1 log the PLL registers, 2 also apply the Windows (24 MHz) PLL values");
+		 "EXPERIMENT: after ov13b10 s_stream: 1 log the PLL registers, 2 also apply the Windows (24 MHz) PLL values, 3 also the other Windows mode registers (0x3813=08 ...)");
 
 /*
  * EXPERIMENT (GZ302, patch 0028): firmware commands that the Windows driver sends for a working preview and the
@@ -112,7 +115,7 @@ MODULE_PARM_DESC(sensor_pll,
 #define EXP_WIN_ITIME_RANGE	0x20
 #define EXP_WIN_PREFETCH	0x40
 
-static unsigned int win_cmds;
+static unsigned int win_cmds = 0x77;	/* patch 0035: all but scene mode */
 module_param(win_cmds, uint, 0444);
 MODULE_PARM_DESC(win_cmds,
 		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range, 0x40 global ENABLE_PREFETCH (0 = none)");
@@ -124,7 +127,7 @@ MODULE_PARM_DESC(win_cmds,
  * The firmware logs its reading as "RTPipe MMHub Prefetch", "SoftRTPipe MMHub Prefetch", "Add YUV GAP".
  * Default 7 = {1,1,1}, the patch 0029 behaviour.  Only used when win_cmds has bit 0x40.
  */
-static unsigned int prefetch_flags = 7;
+static unsigned int prefetch_flags = 1;	/* patch 0035: RT-pipe prefetch only */
 module_param(prefetch_flags, uint, 0444);
 MODULE_PARM_DESC(prefetch_flags,
 		 "EXPERIMENT: ENABLE_PREFETCH payload, bit N -> word N (0..2), default 7 = {1,1,1}; needs win_cmds bit 0x40");
@@ -200,6 +203,7 @@ static int isp4sd_exp_wr8(struct i2c_client *client, u16 reg, u8 val)
 /* PLL, stream and MIPI timing registers that differ or matter between the Windows and Linux tables */
 static const u16 exp_pll_regs[] = {
 	0x0100, 0x0303, 0x0305, 0x0321, 0x0323, 0x0324, 0x0325, 0x0326, 0x0327, 0x3011, 0x4800, 0x4837,
+	0x3600, 0x380f, 0x3813, 0x3774, 0x3823, 0x3827,	/* patch 0033: mode registers of sensor_pll=3 */
 };
 
 static void isp4sd_exp_pll_dump(struct device *dev, struct i2c_client *client, const char *when)
@@ -242,6 +246,31 @@ static int isp4sd_exp_pll_apply_windows(struct device *dev, struct i2c_client *c
 		if (i == 0)
 			usleep_range(5000, 6000);	/* let the current frame end before touching the PLL */
 	}
+	if (sensor_pll >= 3) {
+		/*
+		 * patch 0033: Windows mode values that differ from the Linux table (section 59), still in standby.
+		 * Exposure/gain registers (0x3501/0x3502/0x3508/0x3509) are left out: the firmware's AE writes them.
+		 */
+		static const struct { u16 reg; u8 val; } mode[] = {
+			{ 0x3813, 0x08 },	/* vertical window offset (Linux 0x09): Bayer phase */
+			{ 0x3600, 0x1a },	/* analog (Linux 0x16) */
+			{ 0x380f, 0x94 },	/* frame length low byte, 0x0c94 = 3220 lines (Linux 0x7c) */
+			{ 0x3011, 0x7c },	/* only in the Windows table */
+			{ 0x3774, 0x2d },	/* only in the Windows table */
+			{ 0x3823, 0x18 },	/* only in the Windows table */
+			{ 0x3827, 0x01 },	/* only in the Windows table */
+		};
+
+		for (unsigned int i = 0; i < ARRAY_SIZE(mode); i++) {
+			ret = isp4sd_exp_wr8(client, mode[i].reg, mode[i].val);
+			if (ret) {
+				dev_err(dev, "EXP-SENSOR: mode write 0x%04x=0x%02x failed: %d\n",
+					mode[i].reg, mode[i].val, ret);
+				return ret;
+			}
+		}
+		dev_info(dev, "EXP-SENSOR: applied the Windows mode registers (0x3813=08 0x3600=1a 0x380f=94 0x3011=7c 0x3774=2d 0x3823=18 0x3827=01)\n");
+	}
 	usleep_range(5000, 6000);		/* PLL lock */
 	ret = isp4sd_exp_wr8(client, 0x0100, 0x01);	/* stream on */
 	dev_info(dev, "EXP-SENSOR: applied the Windows PLL values (0x0303=01 0x0305=46 0x0325=55), stream on -> %d\n", ret);
@@ -274,6 +303,15 @@ static void isp4sd_exp_burst_fn(struct work_struct *work)
 }
 
 static DECLARE_DELAYED_WORK(exp_burst_work, isp4sd_exp_burst_fn);
+
+/*
+ * EXPERIMENT (GZ302, patch 0034, tuning step 4): the D-PHY diagnostics of patch 0022 sleep 1.1 s inside
+ * the buffer-send path (start_streaming), during which the host cannot queue buffers and frames are
+ * dropped ("Preview buffer is not available").  phy_diag=0 skips them.  Default 1 = as before.
+ */
+static bool phy_diag;	/* patch 0035: default off (no sleeps in the send path) */
+module_param(phy_diag, bool, 0444);
+MODULE_PARM_DESC(phy_diag, "EXPERIMENT: D-PHY state dumps (+100 ms, +1 s) after the sensor starts; 0 skips the 1.1 s of sleeps");
 
 static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *ispif, const char *when)
 {
@@ -340,7 +378,7 @@ static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *i
 		schedule_delayed_work(&exp_burst_work, msecs_to_jiffies(sensor_burst_ms));
 		dev_info(dev, "EXP-SENSOR: burst limit armed: sensor standby in %u ms\n", sensor_burst_ms);
 	}
-	if (!ret && isp4if_phy_init_enabled()) {
+	if (!ret && isp4if_phy_init_enabled() && phy_diag) {	/* patch 0034: phy_diag=0 skips the sleeps */
 		/* patch 0022: D-PHY state right after, 100 ms and 1 s after the sensor started streaming */
 		isp4if_phy_diag(ispif, "after s_stream");
 		msleep(100);
@@ -395,7 +433,7 @@ static void isp4sd_exp_sensor_stop(struct device *dev)
 #define EXP_META_DATA_BUF_SIZE		0x20000
 #define EXP_META_DATA_BUF_MAX		6
 
-static unsigned int meta_data_bufs;
+static unsigned int meta_data_bufs = 6;	/* patch 0035: like Windows */
 module_param(meta_data_bufs, uint, 0444);
 MODULE_PARM_DESC(meta_data_bufs,
 		 "EXPERIMENT: send N (max 6) type-13 META_DATA buffers of 128 KiB before START_STREAM, like Windows (0 = off)");
@@ -408,6 +446,21 @@ struct exp_meta_data_buf {
 
 static struct exp_meta_data_buf exp_meta_data[EXP_META_DATA_BUF_MAX];
 static unsigned int exp_meta_data_cnt;
+
+/*
+ * EXPERIMENT (GZ302, patch 0034, tuning step 2): the firmware takes one META_DATA buffer per frame
+ * ("LoadFrameMetaData: No meta data buffer is available" once per frame after the first 6) and the
+ * Linux driver never gives them back.  Windows re-sends a META_INFO + META_DATA pair after every
+ * frame-done (ResendMetaInFrameDone, same index for both).  The frame-done meta info does not say
+ * which META_DATA buffer was used, so they are re-sent round-robin in submission order (INFERENCE:
+ * the firmware consumes them in order, one per frame).  Needs meta_data_bufs.
+ */
+static bool meta_data_resend = true;	/* patch 0035: default on */
+module_param(meta_data_resend, bool, 0444);
+MODULE_PARM_DESC(meta_data_resend,
+		 "EXPERIMENT: re-send one type-13 META_DATA buffer (round-robin) after every frame-done, like Windows");
+
+static unsigned int exp_meta_data_next;	/* next META_DATA buffer to re-send */
 
 static void isp4sd_exp_meta_data_free(void)
 {
@@ -551,6 +604,7 @@ static int isp4sd_send_meta_buf(struct isp4_subdev *isp_subdev)
 			}
 		}
 		dev_info(dev, "EXP: sent %u type-13 META_DATA buffers of 0x%x bytes\n", want, EXP_META_DATA_BUF_SIZE);
+		exp_meta_data_next = 0;		/* patch 0034: round-robin re-send starts at the first buffer */
 		memset(&buf_type, 0, sizeof(buf_type));
 	}
 
@@ -973,6 +1027,23 @@ static void isp4sd_fw_resp_frame_done(struct isp4_subdev *isp_subdev,
 
 	if (isp_subdev->sensor_info.status == ISP4SD_START_STATUS_STARTED)
 		isp4sd_send_meta_info(isp_subdev, mc);
+
+	/* patch 0034: give one META_DATA buffer back per frame, like Windows' ResendMetaInFrameDone */
+	if (meta_data_resend && exp_meta_data_cnt &&
+	    isp_subdev->sensor_info.status == ISP4SD_START_STATUS_STARTED) {
+		struct exp_meta_data_buf *b = &exp_meta_data[exp_meta_data_next % exp_meta_data_cnt];
+		struct isp4fw_cmd_send_buffer md;
+
+		memset(&md, 0, sizeof(md));
+		md.buffer_type = EXP_BUFFER_TYPE_META_DATA;
+		md.buffer.vmid_space.bit.space = ISP4FW_ADDR_SPACE_TYPE_GPU_VA;
+		isp4if_split_addr64(b->gpu_addr, &md.buffer.buf_base_a_lo, &md.buffer.buf_base_a_hi);
+		md.buffer.buf_size_a = EXP_META_DATA_BUF_SIZE;
+		if (isp4if_send_command(ispif, ISP4FW_CMD_ID_SEND_BUFFER, &md, sizeof(md)))
+			dev_err(dev, "EXP: re-send of META_DATA %u failed\n",
+				exp_meta_data_next % exp_meta_data_cnt);
+		exp_meta_data_next++;
+	}
 
 	dev_dbg(dev, "stream_id:%d, status:%d\n", stream_id,
 		isp_subdev->sensor_info.status);

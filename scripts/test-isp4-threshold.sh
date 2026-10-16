@@ -66,6 +66,15 @@
 #     ./scripts/test-isp4-threshold.sh ... --win-cmds 0x77 --prefetch-flags 0
 #                                                            # ENABLE_PREFETCH payload words from bits 0..2
 #                                                            # (patch 0030; default 7 = {1,1,1})
+#     ./scripts/test-isp4-threshold.sh ... --script-i2c 1
+#                                                            # fill the device script's I2C descriptors
+#                                                            # (patch 0032): 1 sensor, 2 + focus motor, 3 all
+#     ./scripts/test-isp4-threshold.sh ... --meta-data-resend --no-phy-diag
+#                                                            # re-send a META_DATA buffer per frame, and skip
+#                                                            # the 1.1 s PHY diagnostics in the send path (0034)
+#     ./scripts/test-isp4-threshold.sh --module-defaults --seconds 8
+#                                                            # load the module with NO experiment parameters:
+#                                                            # tests its own defaults (patch 0035)
 #
 # Output goes to scratch/isp4-threshold/results/ (inside the project).
 set -u -o pipefail
@@ -78,20 +87,26 @@ values="4 2 1"
 dev=""
 mmap=4
 seconds=15
-replay=0
+# patch 0035: the defaults below are the working configuration (findings sections 85-93), the same values
+# the module itself now defaults to; options still override them.  --module-defaults passes none of them.
+replay=1
 variants="0"
 bogus=0
-tuning=""
+tuning="/lib/firmware/amdgpu/OV13B_3001_ROG_SRX.atb"
 pool_mb=0
-start_sensor=0
-pm_cycle=0
-phy_init=0
+start_sensor=1
+pm_cycle=1
+phy_init=1
 skip_gpio=0
-sensor_pll=0
+sensor_pll=0	# patch 0036: ov13b10 applies the GZ302 registers itself; 3 = old raw-I2C path
 burst_ms=0
-meta_data_bufs=0
-win_cmds=0
-prefetch_flags=7
+meta_data_bufs=6
+win_cmds=0x77
+prefetch_flags=1
+script_i2c=2
+meta_data_resend=1
+phy_diag=0
+module_defaults=0
 
 while [[ $# -gt 0 ]]; do
 	case $1 in
@@ -113,6 +128,10 @@ while [[ $# -gt 0 ]]; do
 	--meta-data-bufs) meta_data_bufs=$2; shift 2 ;;
 	--win-cmds) win_cmds=$2; shift 2 ;;
 	--prefetch-flags) prefetch_flags=$2; shift 2 ;;
+	--script-i2c) script_i2c=$2; shift 2 ;;
+	--meta-data-resend) meta_data_resend=1; shift ;;
+	--no-phy-diag) phy_diag=0; shift ;;
+	--module-defaults) module_defaults=1; shift ;;
 	*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -180,7 +199,12 @@ for run in "${runs[@]}"; do
 	fi
 
 	cursor=$(sudo journalctl -k -n 0 --show-cursor --no-pager | sed -n 's/^-- cursor: //p')
-	sudo insmod "$ko" min_start_bufs="$n" replay_sensor_setup="$replay" sensor_prop_variant="$v" bogus_cmd="$bogus" tuning_file="$tuning" fw_mem_pool_mb="$pool_mb" start_sensor="$start_sensor" sensor_pm_cycle="$pm_cycle" phy_init="$phy_init" skip_enable_gpio="$skip_gpio" sensor_pll="$sensor_pll" sensor_burst_ms="$burst_ms" meta_data_bufs="$meta_data_bufs" win_cmds="$win_cmds" prefetch_flags="$prefetch_flags" dyndbg=+p || die "insmod failed; see: sudo dmesg | tail -30"
+	if [[ $module_defaults == 1 ]]; then
+		# patch 0035: only debug output on; every experiment parameter keeps the module's own default
+		sudo insmod "$ko" dyndbg=+p || die "insmod failed; see: sudo dmesg | tail -30"
+	else
+	sudo insmod "$ko" min_start_bufs="$n" replay_sensor_setup="$replay" sensor_prop_variant="$v" bogus_cmd="$bogus" tuning_file="$tuning" fw_mem_pool_mb="$pool_mb" start_sensor="$start_sensor" sensor_pm_cycle="$pm_cycle" phy_init="$phy_init" skip_enable_gpio="$skip_gpio" sensor_pll="$sensor_pll" sensor_burst_ms="$burst_ms" meta_data_bufs="$meta_data_bufs" win_cmds="$win_cmds" prefetch_flags="$prefetch_flags" script_i2c="$script_i2c" meta_data_resend="$meta_data_resend" phy_diag="$phy_diag" dyndbg=+p || die "insmod failed; see: sudo dmesg | tail -30"
+	fi
 	sleep 2
 
 	if sudo test -e /sys/kernel/debug/amd_isp4/fw_log_enable; then
