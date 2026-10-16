@@ -1,69 +1,128 @@
-# GZ302 rear-camera bring-up
+# Rear camera for the ASUS ROG Flow Z13 2025 (GZ302EA) on Linux
 
-This directory contains the first half of a kernel enablement patch for the
-GZ302EA rear OV13B10 sensor (`OMNI13B1`).  It supplies the software-node graph
-which ASUS's ACPI table omits.  Nothing here overwrites a system file.
+The rear camera of the 2025 Flow Z13 (AMD Ryzen AI Max "Strix Halo") does not work on stock Linux: the
+OmniVision **OV13B10** sensor sits behind AMD's image signal processor (**ISP 4.1**), and the kernel's ISP
+drivers only know AMD's reference board. This repository makes it work: kernel patches, an AUR kernel
+package, a firmware package that you build from your own Windows install, and the notes and tools from
+the bring-up.
 
-## Important correction after the first live test
+> **Status: working, still being tuned.** `/dev/video0` gives live **1920x1080 NV12 at 30 fps**
+> (YUYV and 1920x1440 also offered) with auto exposure and neutral colours; tested with ffplay and OBS.
+> Not done yet: autofocus (the lens stays at its rest position, sharp at room distance), white balance
+> and image tuning matched to Windows. The driver still writes a lot of debug output (`EXP-...` lines)
+> to the kernel log. The front and IR cameras are separate USB cameras and already work on stock Linux.
 
-The temporary `amd_isp4.ko` module loaded and bound to `OMNI13B1`, but no ISP
-MFD children or I2C adapter appeared.  This proves the software-node patch is
-valid at the platform-driver boundary, but it cannot activate the hardware on
-its own.
+## Install (Arch / CachyOS)
 
-The second missing change is in `drivers/gpu/drm/amd/amdgpu/amdgpu_acpi.c`:
-AMDGPU's ISP allow-list has only `OMNI5C10`, so it declines to create the ISP
-capture, I2C, and GPIO MFD devices for this machine.  The required one-line
-AMDGPU change is recorded in `amdgpu-acpi-omni13b1.patch`.
+1. Copy three files from your **own Windows install** into `~/cam-firm-gz302ea/` (any upper/lower case):
 
-Both patches must be present in a kernel build.  The platform graph must also
-be registered before AMDGPU starts ISP hardware initialization, so build
-`CONFIG_AMD_ISP_PLATFORM=y` (not a late-loaded module) for the first real boot
-test.  The present external module is still useful only after that MFD layer
-exists.
+   | file | Windows folder |
+   |---|---|
+   | `OV13B_3001_ROG_SRX.atb` | `C:\Windows\System32\DriverStore\FileRepository\sensorov13b.inf_amd64_*\` |
+   | `asm_OV13B.asm` | same folder |
+   | `srx_h_isp_firmware_signed.ram` | `C:\Windows\System32\DriverStore\FileRepository\amdcamera.inf_amd64_*\` |
 
-## Build result
+2. Install the kernel from the AUR (this builds `gz302-camera-firmware` first, which refuses to build
+   without the three files):
 
-`amd_isp4.ko` was built successfully against the local
-`7.1.6-1-cachyos-deckify` headers.  Its vermagic exactly matches the running
-kernel and it advertises both the existing `OMNI5C10` and new `OMNI13B1` ACPI
-aliases.  Kernel lockdown is `none`; unsigned test modules are permitted.
+   ```sh
+   paru -S linux-cachyos-camera
+   ```
 
-## Initial assumptions
+3. Reboot into **linux-cachyos-camera** and check: `uname -r` ends in `-cachyos-camera`, then
+   `ffplay -f v4l2 -video_size 1920x1080 -input_format nv12 /dev/video0`.
 
-- I2C address: `0x10`, from the camera ACPI `_DSM`.
-- CSI-2 configuration: four data lanes, link frequency 560 MHz.  This selects
-  the OV13B10 driver's full-resolution 4208x3120 mode.
-- Declared sensor clock: 19.2 MHz, which is what the upstream OV13B10 driver
-  requires.  On this software-node platform that declaration is a fixed-rate
-  dummy clock, so image quality—not probe success—will validate the real clock.
+Details and troubleshooting: [`aur/README.md`](aur/README.md).
 
-## Current cleanup
+Not on Arch? The patches in [`kernel/patches/`](kernel/patches/) apply to mainline Linux (tested against
+7.2.9 and 7.3-rc6); you still need the firmware files the AUR package builds
+([`tools/`](tools/), see below).
 
-If you ran the initial loader, return to the normal module state now:
+## What it takes
 
-```bash
-cd ~/Projects/camera-bringup
-./load-patched-isp4.sh unload
+The camera needs changes in four kernel drivers plus a set of firmware and data files.
+
+```
+amdgpu (ISP power, firmware)         0001 recognise the GZ302's ACPI camera  0003/0005 GPIO lookups
+  └─ amd_isp4 (board description)    0002 describe the OV13B10 and its CSI-2 link
+       ├─ ov13b10 (sensor driver)    0004 I2C id, 0006 GZ302 PLL and mode registers
+       └─ amd_isp4_capture (V4L2)    0007 everything the ISP firmware needs to stream (from 0009-0037)
 ```
 
-## Future reversible test
+| patch | driver | why |
+|---|---|---|
+| 0001 | amdgpu | amdgpu only starts the ISP for AMD's reference sensor (`OMNI5C10`); the GZ302 reports `OMNI13B1` |
+| 0002 | amd_isp4 | ASUS's ACPI table describes no I2C address, lanes or clock for the sensor; this adds them |
+| 0003 | amdgpu | provides the `enable_isp` GPIO the capture driver asks for before it registers (on the GZ302 that line only drives the camera LED, so the driver leaves it alone) |
+| 0004 | ov13b10 | lets the sensor driver bind to the I2C device the board code creates |
+| 0005 | amdgpu | maps the sensor reset line so the sensor powers up before its I2C probe |
+| 0006 | ov13b10 | the PLL and mode registers Windows uses on this laptop (wrong values give a magenta image) |
+| 0007 | amd_isp4_capture | firmware memory pool sized like Windows, MMHUB prefetch, I2C descriptors in the device script, per-frame meta-data buffers, sensor start, data files loaded as firmware |
 
-Run from a normal desktop terminal:
+Run-time files (in `/usr/lib/firmware/`, installed by `gz302-camera-firmware`):
 
-```bash
-cd ~/Projects/camera-bringup
-./load-patched-isp4.sh load
+| file | made from | shipped here? |
+|---|---|---|
+| `updates/amdgpu/isp_4_1_1.bin` | the Windows ISP firmware (`srx_h_isp_firmware_signed.ram`) with the Linux header | no, built on your machine |
+| `amdgpu/gz302-ov13b-script.bin` | the Windows sensor script `asm_OV13B.asm`, assembled | no, built on your machine |
+| `amdgpu/OV13B_3001_ROG_SRX.atb` | the Windows sensor tuning file, unchanged | no, your copy |
+| `amdgpu/gz302-ov13b-phy-seq.bin` | the MIPI D-PHY receiver register sequence | yes, [`data/`](data/) |
+| `amdgpu/gz302-ov13b-sensor-prop.bin` | the sensor property block | yes, [`data/`](data/) |
+
+AMD's and ASUS's files are never distributed here; the firmware package builds the first two from the
+files you copy, with [`tools/build_winfw.py`](tools/build_winfw.py) and
+[`tools/assemble_ov13b.py`](tools/assemble_ov13b.py).
+
+## Building the kernel yourself
+
+```sh
+bash scripts/rebuild-camera-kernel.sh
 ```
 
-The script loads the patched platform driver first, then the in-tree capture
-driver, and prints adapter, media-node and kernel-log evidence.  Run it only
-after a custom kernel with both source changes has booted.  To undo it:
+Fetches CachyOS's current PKGBUILD, checks every patch applies without fuzz, builds
+`linux-cachyos-camera` (BORE scheduler, GCC without LTO, znver4 tuning) and installs it with
+`pacman -U`; it stops at the first problem. [`kernel/hooks/`](kernel/hooks/) has a pacman hook that
+reminds you to run it when CachyOS releases a new kernel.
 
-```bash
-./load-patched-isp4.sh unload
-```
+## Repository layout
 
-Do not install this module into `/lib/modules` yet.  First boot the combined
-kernel patch and verify that the three ISP MFD devices exist, then test a
-stream only after an ISP media/video node appears.
+| path | contents |
+|---|---|
+| [`kernel/patches/`](kernel/patches/) | the 7-patch kernel series (the thing to use) |
+| [`aur/`](aur/) | the two AUR packages and their instructions |
+| [`driver/`](driver/) | the capture driver as an out-of-tree module, with its development history as patches 0009-0037 ([`driver/README.md`](driver/README.md)) |
+| [`sensor/`](sensor/) | the ov13b10 sensor driver with the GZ302 quirk, out of tree |
+| [`dkms/`](dkms/) | DKMS package for the capture driver (for kernels that already carry the amdgpu changes) |
+| [`data/`](data/) | the two data files shipped with the firmware package |
+| [`tools/`](tools/) | firmware/script builders, D-PHY and disassembly helpers, Windows trace decoders |
+| [`scripts/`](scripts/) | build, test and release scripts (each one starts with a comment saying what it does) |
+| [`docs/`](docs/) | [`findings.md`](docs/findings.md) (the full bring-up log), [`upstream-plan.md`](docs/upstream-plan.md), [`learning-notes.md`](docs/learning-notes.md) |
+
+## How it was done
+
+The Linux ISP 4.1 driver works on AMD's reference board but not here, and the Windows driver is the
+only working reference. The bring-up compared the two: Windows ETW traces of every command the driver
+sends to the ISP firmware, static analysis of `amdcamera.sys` and `sensorOV13B.sys` for payload layouts
+and register tables, and many test runs on Linux, each changing one thing. The result of each run, right
+or wrong, is in [`docs/findings.md`](docs/findings.md).
+
+## Upstream
+
+The goal is to need no custom kernel: the amdgpu and amd_isp4 changes (0001-0005) are small and could
+go to CachyOS or mainline, after which a stock kernel plus a DKMS package would be enough. Patch 0007
+needs its debug code removed and splitting into reviewable pieces first. The ISP firmware itself would
+have to come from AMD through linux-firmware. See [`docs/upstream-plan.md`](docs/upstream-plan.md).
+
+## Contributing
+
+Reports from other GZ302 owners are welcome, especially whether the `gz302-camera-firmware` build says
+"different version" for your Windows files and whether the camera still works then. Please include
+`uname -r`, the package versions and `journalctl -k -b | grep -i -E "isp|ov13b"`.
+
+## License and disclaimer
+
+GPL-2.0 ([`LICENSE`](LICENSE)), the license of the kernel code the patches change. Not affiliated with
+ASUS, AMD or OmniVision. The files you copy from Windows remain their owners' property. This changes
+your kernel; keep another kernel installed to boot from if something goes wrong.
+
+Built on CachyOS's kernel PKGBUILDs and the upstream AMD ISP4 drivers.

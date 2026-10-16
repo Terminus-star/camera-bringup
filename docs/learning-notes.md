@@ -1027,3 +1027,11 @@ tables straight from the binary, evaluates the single branch path for our case (
 **What we learned:** the AUR is a set of small git repositories, one per package, holding only the PKGBUILD, `.SRCINFO` and local source files; the code itself comes from the URLs in `source=()`, here a tag tarball of the public GitHub repo. That is why the firmware checksum can only be filled in after the tag exists, and why each AUR push must carry a `.SRCINFO` that matches its PKGBUILD.
 
 **Concept to understand: `git commit -- <paths>`.** Normally `git commit` records everything that is staged. With paths after `--` it records only those paths (their current content) and leaves the rest of the staged changes for the next commit. That is how one big staging area can still become several commits that each hold one logical change.
+
+## Task: new top-level README
+
+**What changed:** `README.md` rewritten: status, install from the AUR, what each patch and firmware file is for (and which files are never shipped), building it yourself, repository layout, how the bring-up was done, upstream plan, contributing, license. The old README described the very first `amd_isp4.ko` experiment.
+
+**What we learned:** every claim in a README should be checkable: the formats and frame rate come from `driver/isp4_video.c` and the findings, each link was checked against `git ls-files`, and one description (patch 0003) was corrected because the findings showed its GPIO is the camera LED line, not something the ISP needs.
+
+**Concept to understand: tracked files and `.gitignore`.** `.gitignore` only stops *untracked* files from being added; files that were committed before the rule existed stay tracked and keep being published. Removing them from the repository (while keeping them on disk, if wanted) takes `git rm --cached <file>` and a commit; they still exist in the older commits of the history.
