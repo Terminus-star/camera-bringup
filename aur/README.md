@@ -19,7 +19,7 @@ Create the folder `~/cam-firm-gz302ea/` (upper/lower case does not matter) and c
 | file | from (in Windows) |
 |---|---|
 | `OV13B_3001_ROG_SRX.atb` | `C:\Windows\System32\DriverStore\FileRepository\sensorov13b.inf_amd64_*\` |
-| `asm_OV13B.asm` | same folder |
+| `asm_OV13B.asm` | `C:\Windows\System32\DriverStore\FileRepository\sensorov13b.inf_amd64_*\` |
 | `srx_h_isp_firmware_signed.ram` | `C:\Windows\System32\DriverStore\FileRepository\amdcamera.inf_amd64_*\` |
 
 From Linux you can read them from the Windows partition (mount it read-only), or copy them to a USB
@@ -28,12 +28,27 @@ firmware package uses your copies to build the ISP firmware image and the sensor
 
 ## 2. Install
 
+The packages are not on the AUR yet (the AUR is not accepting new accounts at the moment). Until then,
+build them from a clone of the repository:
+
 ```sh
-paru -S linux-cachyos-camera        # builds gz302-camera-firmware first; or yay
+git clone https://github.com/Terminus-star/camera-bringup.git
+cd camera-bringup
+bash scripts/install-local-packages.sh
 ```
 
-Without an AUR helper: build and install `gz302-camera-firmware` first (`makepkg -si` in its folder),
-then `linux-cachyos-camera`. The kernel build takes a while (no LTO keeps it shorter).
+The script checks the prerequisites first (the folder above, no hand-copied camera files in the way),
+then builds and installs `gz302-camera-firmware` and after it `linux-cachyos-camera` with its headers,
+asking for sudo before each install. By hand, firmware first:
+
+```sh
+cd aur/gz302-camera-firmware && makepkg -si
+cd ../linux-cachyos-camera && makepkg -si
+```
+
+Once they are on the AUR: `paru -S linux-cachyos-camera` (builds `gz302-camera-firmware` first).
+The kernel build takes a while (no LTO keeps it shorter). For a new CachyOS release, `git pull` and
+build again.
 
 If you copied camera files into `/lib/firmware/amdgpu/` by hand before, pacman stops with
 "exists in filesystem": remove those files (`gz302-ov13b-*.bin`, `OV13B_3001_ROG_SRX.atb`) and install again.

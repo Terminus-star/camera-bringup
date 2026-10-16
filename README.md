@@ -19,18 +19,50 @@ the bring-up.
    | file | Windows folder |
    |---|---|
    | `OV13B_3001_ROG_SRX.atb` | `C:\Windows\System32\DriverStore\FileRepository\sensorov13b.inf_amd64_*\` |
-   | `asm_OV13B.asm` | same folder |
+   | `asm_OV13B.asm` | `C:\Windows\System32\DriverStore\FileRepository\sensorov13b.inf_amd64_*\` |
    | `srx_h_isp_firmware_signed.ram` | `C:\Windows\System32\DriverStore\FileRepository\amdcamera.inf_amd64_*\` |
 
-2. Install the kernel from the AUR (this builds `gz302-camera-firmware` first, which refuses to build
-   without the three files):
+   With the Windows partition mounted (read-only is enough), e.g. at `/mnt/windows`:
 
    ```sh
-   paru -S linux-cachyos-camera
+   mkdir ~/cam-firm-gz302ea
+   cp /mnt/windows/Windows/System32/DriverStore/FileRepository/sensorov13b.inf_amd64_*/OV13B_3001_ROG_SRX.atb ~/cam-firm-gz302ea/
+   cp /mnt/windows/Windows/System32/DriverStore/FileRepository/sensorov13b.inf_amd64_*/asm_OV13B.asm ~/cam-firm-gz302ea/
+   cp /mnt/windows/Windows/System32/DriverStore/FileRepository/amdcamera.inf_amd64_*/srx_h_isp_firmware_signed.ram ~/cam-firm-gz302ea/
    ```
+
+2. Build and install the two packages from a clone of this repository (the packages are not on the
+   AUR yet, because the AUR is not accepting new accounts at the moment):
+
+   ```sh
+   git clone https://github.com/Terminus-star/camera-bringup.git
+   cd camera-bringup
+   bash scripts/install-local-packages.sh
+   ```
+
+   The script first checks the folder above and that no camera files copied by hand are in the way
+   (it lists every problem with the command to fix it), then builds and installs
+   `gz302-camera-firmware`, then builds and installs `linux-cachyos-camera` and its headers. It asks
+   for sudo before installing anything and stops at the first problem. Running it again is safe: it
+   skips packages already installed at that version, and if the kernel was compiled but not installed
+   (for example the sudo prompt timed out) it installs the built packages without compiling again
+   (`--rebuild` forces a new compile, `--dry-run` only shows what it would do). The packages are
+   normal pacman packages, so `pacman -Q linux-cachyos-camera` shows them and `pacman -R` removes them.
+
+   The same by hand, firmware first (the kernel package depends on it):
+
+   ```sh
+   cd aur/gz302-camera-firmware && makepkg -si
+   cd ../linux-cachyos-camera && makepkg -si
+   ```
+
+   Once the packages are on the AUR, `paru -S linux-cachyos-camera` will do both steps.
 
 3. Reboot into **linux-cachyos-camera** and check: `uname -r` ends in `-cachyos-camera`, then
    `ffplay -f v4l2 -video_size 1920x1080 -input_format nv12 /dev/video0`.
+
+Updating: when CachyOS releases a new kernel, `git pull` in the clone and run the script again (the
+kernel package is updated in this repository for each release).
 
 Details and troubleshooting: [`aur/README.md`](aur/README.md).
 
@@ -73,16 +105,20 @@ AMD's and ASUS's files are never distributed here; the firmware package builds t
 files you copy, with [`tools/build_winfw.py`](tools/build_winfw.py) and
 [`tools/assemble_ov13b.py`](tools/assemble_ov13b.py).
 
-## Building the kernel yourself
+## Newer CachyOS release than this repository
+
+The kernel package in [`aur/linux-cachyos-camera/`](aur/linux-cachyos-camera/) is updated here for each
+CachyOS release. If CachyOS is ahead of it:
 
 ```sh
 bash scripts/rebuild-camera-kernel.sh
 ```
 
-Fetches CachyOS's current PKGBUILD, checks every patch applies without fuzz, builds
+Fetches CachyOS's current PKGBUILD, checks every patch applies without fuzz, builds the same
 `linux-cachyos-camera` (BORE scheduler, GCC without LTO, znver4 tuning) and installs it with
-`pacman -U`; it stops at the first problem. [`kernel/hooks/`](kernel/hooks/) has a pacman hook that
-reminds you to run it when CachyOS releases a new kernel.
+`pacman -U`; it stops at the first problem. That build does not declare the firmware dependency, so
+install `gz302-camera-firmware` first (step 2 above). [`kernel/hooks/`](kernel/hooks/) has a pacman
+hook that reminds you when CachyOS releases a new kernel.
 
 ## Repository layout
 
