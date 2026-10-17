@@ -14,6 +14,21 @@ the bring-up.
 
 ## Install (Arch / CachyOS)
 
+**Before you start:**
+
+- **CachyOS's signing keys** in your gpg keyring (makepkg checks the kernel tarball's signature with
+  them and otherwise stops with "unknown public key"):
+
+  ```sh
+  gpg --recv-keys E8B9AA39F054E30E8290D492C3C4820857F654FE E18447AC260021D31F3FF6C4C8A2A4774B8B63C4
+  ```
+
+- **About 35 GB free** on the disk holding the clone while the kernel builds (the build tree is
+  deleted again afterwards), and **20-30 minutes** for the build on the GZ302.
+- Your **Windows install** (or a copy of its driver folder) for the three files in step 1.
+- Tested on **CachyOS with the Limine bootloader**. Plain Arch should work but is untested; with GRUB
+  or systemd-boot you may have to update the boot menu the way you normally do after a kernel install.
+
 1. Copy three files from your **own Windows install** into `~/cam-firm-gz302ea/` (any upper/lower case):
 
    | file | Windows folder |

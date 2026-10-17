@@ -12,6 +12,15 @@ The kernel package depends on the firmware package, so it will not build or inst
 The camera is still being tuned: the driver writes a lot of debug output to the kernel log
 (`EXP-...` lines), autofocus is not driven yet, and colours are not yet matched to Windows.
 
+## Before you start
+
+- Import CachyOS's signing keys, which makepkg uses to check the kernel tarball (otherwise it stops
+  with "unknown public key"):
+  `gpg --recv-keys E8B9AA39F054E30E8290D492C3C4820857F654FE E18447AC260021D31F3FF6C4C8A2A4774B8B63C4`
+- Have about 35 GB free where you build (the kernel build tree; `scripts/install-local-packages.sh`
+  deletes it after a successful build) and 20-30 minutes for the build.
+- Tested on CachyOS with Limine; with GRUB or systemd-boot, update the boot menu as you normally do.
+
 ## 1. Copy three files from Windows
 
 Create the folder `~/cam-firm-gz302ea/` (upper/lower case does not matter) and copy into it:

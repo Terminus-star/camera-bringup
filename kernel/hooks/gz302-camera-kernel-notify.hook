@@ -15,4 +15,4 @@ Target = linux-cachyos
 [Action]
 Description = GZ302 camera: new CachyOS kernel, the camera kernel needs a rebuild
 When = PostTransaction
-Exec = /usr/bin/echo "==> GZ302 camera: run  bash /home/termis/Projects/camera-bringup/scripts/rebuild-camera-kernel.sh  (as your user) to build and install the matching linux-cachyos-camera kernel."
+Exec = /usr/bin/echo "==> GZ302 camera: in your camera-bringup clone, run  git pull  and then  bash scripts/install-local-packages.sh  (as your user); if CachyOS is newer than the clone, use  bash scripts/rebuild-camera-kernel.sh  instead."

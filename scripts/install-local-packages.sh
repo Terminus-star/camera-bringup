@@ -21,6 +21,8 @@
 #   - ~/cam-firm-gz302ea/ (any upper/lower case) must exist, if the firmware package needs building
 #   - none of the files the firmware package installs may already exist without belonging to it
 #     (e.g. copies made by hand); pacman would refuse with "exists in filesystem"
+#   - the CachyOS signing keys must be in your gpg keyring, if the kernel needs building
+# Just before compiling the kernel it also checks for about 35 GB of free space in kernel/build/.
 # Then it stops at the first failure. pacman shows what it will do and asks before installing.
 # Build folders: kernel/build/local/<package>/ (git-ignored); downloads go to kernel/build/tarballs/
 # (SRCDEST), so the kernel tarball is fetched only once.
@@ -80,6 +82,19 @@ for f in /usr/lib/firmware/updates/amdgpu/isp_4_1_1.bin \
 		problems=1
 	fi
 done
+# makepkg checks the CachyOS kernel tarball's signature against YOUR gpg keyring; without the
+# signing keys it stops with "unknown public key". Fingerprints come from the package itself.
+if (( k_needed || rebuild )); then
+	missing_keys=()
+	for k in $(sed -n 's/^\tvalidpgpkeys = //p' "$project_dir/aur/linux-cachyos-camera/.SRCINFO"); do
+		gpg --list-keys "$k" >/dev/null 2>&1 || missing_keys+=("$k")
+	done
+	if (( ${#missing_keys[@]} )); then
+		echo "MISSING: the CachyOS signing keys for the kernel sources. Import them with:" >&2
+		echo "  gpg --recv-keys ${missing_keys[*]}" >&2
+		problems=1
+	fi
+fi
 (( problems == 0 )) || die "fix the problems above, then run this again (nothing was built or installed)"
 
 export SRCDEST="$project_dir/kernel/build/tarballs"
@@ -104,6 +119,13 @@ build_and_install() {
 	if (( have && !force )); then
 		echo "=== $name: using the packages built earlier (no compile); --rebuild to compile again"
 	else
+		if [[ $name == linux-cachyos-camera ]]; then
+			# One kernel build needed about 31 GB here (source tree + objects); -c removes it again
+			# after a successful build. Checked only now, so installing from cache needs no space.
+			local free_gb
+			free_gb=$(df --output=avail -BG "$b" | tail -n 1 | tr -dc '0-9')
+			(( free_gb >= 35 )) || die "only ${free_gb} GB free at $b; the kernel build needs about 35 GB"
+		fi
 		echo "=== building $name in $b (started $(date +%H:%M))"
 		(cd "$b" && makepkg -f "$@") || die "makepkg failed for $name (see above)"
 		echo "=== $name built $(date +%H:%M)"
@@ -121,7 +143,9 @@ else
 fi
 if (( k_needed || rebuild )); then
 	# -s: install the kernel's missing build tools (bc, rust-bindgen, ...) with pacman, asking first.
-	build_and_install linux-cachyos-camera "$rebuild" -s
+	# -c: delete the ~31 GB build tree after a successful build (the finished packages stay, so a
+	#     timed-out install can still be finished from cache).
+	build_and_install linux-cachyos-camera "$rebuild" -s -c
 else
 	echo "=== linux-cachyos-camera $k_ver already installed; skipped"
 fi
