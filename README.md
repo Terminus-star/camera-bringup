@@ -32,9 +32,6 @@ kernel has to be compiled.
   "Builds" means the drivers compile cleanly against that kernel's headers (findings 143); whether the camera
   works there has not been checked. Reports are welcome (see below).
 - **mkinitcpio** for the initramfs (the Arch and CachyOS default); the package adds an ACPI table to it.
-- **Secure Boot off** (`cat /sys/kernel/security/lockdown` shows `[none]`): a locked-down kernel ignores ACPI
-  tables from the initramfs ("kernel is locked down, ignoring table override"), and amdgpu then never starts the
-  camera.
 - Your **Windows partition, mounted** (read-only is enough; unlock it first if it uses BitLocker), e.g. at
   `/mnt/windows`. Three camera files are taken from it (see below); nothing from Windows is distributed here.
 - Tested on **CachyOS with the Limine bootloader**.
@@ -100,7 +97,10 @@ firmware with the same tools, registers the drivers with `dkms add/build/install
 through dracut (Fedora, `acpi_override="yes"`) or an early initrd (Ubuntu, initramfs-tools has no ACPI table
 option). Points already known:
 
-- Secure Boot (on by default there) must be off, as above.
+- Fedora and Ubuntu reportedly put the kernel in lockdown when Secure Boot is on (not verified here; Arch and
+  CachyOS kernels do not: Secure Boot on, lockdown `[none]`, camera works), and a locked-down kernel ignores
+  ACPI tables from the initramfs ("kernel is locked down, ignoring table override"), so the camera table would
+  not load there; this needs a solution or a documented requirement.
 - Ubuntu 26.04's dkms (3.2.2) predates `BUILD_EXCLUSIVE_KERNEL_MIN` (dkms 3.3.0), so the installer has to check
   the kernel version itself.
 - `tools/build_winfw.py` reads the stock ISP firmware raw or as `.zst`; other compressions (`.xz`) still need
