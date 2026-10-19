@@ -1,4 +1,4 @@
-From: GZ302 camera enablement <local@termis>
+From: GZ302 camera enablement <local>
 Subject: [PATCH] media: amd: isp4: GZ302 OV13B10 capture support
 
 Squash of the out-of-tree driver patches 0009-0055 (see driver/README.md in the

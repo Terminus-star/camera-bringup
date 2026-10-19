@@ -1,4 +1,4 @@
-From: GZ302 camera enablement <local@termis>
+From: GZ302 camera enablement <local>
 Subject: [PATCH] platform/x86: amd: amd_isp4: register the OV13B10 reset GPIO
 
 The OV13B10's reset line on the ASUS ROG Flow Z13 (GZ302) is amdisp-pinctrl

@@ -1,4 +1,4 @@
-From: GZ302 camera enablement <local@termis>
+From: GZ302 camera enablement <local>
 Subject: [PATCH] media: ov13b10: add GZ302 DMI quirk for PLL and mode registers
 
 On the ASUS ROG Flow Z13 (GZ302) the sensor is clocked differently from the

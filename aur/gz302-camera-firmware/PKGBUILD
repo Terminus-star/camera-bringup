@@ -1,7 +1,7 @@
 # Maintainer: Seifelden Abdelmonem <saif.elden.hatim@gmail.com>
 #
 # Firmware and data files for the rear camera (OmniVision OV13B10) of the ASUS ROG Flow Z13 2025
-# (GZ302EA), used by the linux-cachyos-camera kernel.
+# (GZ302EA), used by the camera drivers in gz302-camera-dkms.
 #
 # Nothing from the Windows camera driver is shipped here. You copy three files from your own
 # Windows install into ~/cam-firm-gz302ea/ (the folder name and the file names are matched

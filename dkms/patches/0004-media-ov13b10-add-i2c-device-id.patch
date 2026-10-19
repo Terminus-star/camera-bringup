@@ -1,4 +1,4 @@
-From: GZ302 camera enablement <local@termis>
+From: GZ302 camera enablement <local>
 Subject: [PATCH] media: ov13b10: add I2C device ID table
 
 The AMD ISP platform glue instantiates the sensor as an I2C client named
