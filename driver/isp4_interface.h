@@ -124,6 +124,18 @@ void isp4if_phy_diag(struct isp4_interface *ispif, const char *label);
 /* EXPERIMENT (GZ302 bring-up): replay of the Windows sensor setup, no-op unless replay_sensor_setup=1 */
 int isp4if_replay_sensor_setup(struct isp4_interface *ispif);
 
+/* EXPERIMENT (GZ302, patch 0038): Windows' SET_3A_CONFIG at stream start (starts the firmware's AF) */
+void isp4if_send_3a_config(struct isp4_interface *ispif);
+
+/* EXPERIMENT (GZ302, patch 0044): firmware log levels per module (SET_LOG_MODULE_LEVEL) */
+void isp4if_send_log_levels(struct isp4_interface *ispif);
+
+/* EXPERIMENT (GZ302, patch 0045): 8-bit-register I2C write performed by the firmware (SEND_I2C_MSG) */
+int isp4if_fw_i2c_write(struct isp4_interface *ispif, u8 slave, u8 reg, u8 val);
+
+/* EXPERIMENT (GZ302, patch 0048): module calibration (SET_M2M_CAL_DATA), payload built by isp4_subdev.c */
+void isp4if_send_m2m_cal(struct isp4_interface *ispif, const void *buf, u32 len);
+
 int isp4if_send_command(struct isp4_interface *ispif, u32 cmd_id,
 			const void *package, u32 package_size);
 

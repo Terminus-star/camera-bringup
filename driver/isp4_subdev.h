@@ -124,4 +124,14 @@ int isp4sd_ioc_send_img_buf(struct v4l2_subdev *sd,
 int isp4sd_pwron_and_init(struct v4l2_subdev *sd);
 int isp4sd_pwroff_and_deinit(struct v4l2_subdev *sd);
 
+/*
+ * EXPERIMENT (GZ302, patch 0043): manual focus from the host. The focus motor works when the host
+ * writes it (findings 111) while the firmware's AF path does not reach it, so the video device offers
+ * V4L2_CID_FOCUS_ABSOLUTE 0..1023 and the subdev writes the motor. 400 = Windows' parking position.
+ */
+#define ISP4SD_FOCUS_MAX	1023
+#define ISP4SD_FOCUS_DEFAULT	400
+bool isp4sd_focus_control_enabled(void);
+void isp4sd_set_focus(s32 pos);
+
 #endif /* _ISP4_SUBDEV_H_ */

@@ -3,6 +3,8 @@
  * Copyright (C) 2025 Advanced Micro Devices, Inc.
  */
 
+#include <linux/dmi.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mc.h>
 #include <media/videobuf2-vmalloc.h>
@@ -21,6 +23,23 @@
 #define ISP4VID_ISP_TPF_DEFAULT isp4vid_tpfs[0]
 
 static const char *const isp4vid_video_dev_name = "Preview";
+
+/*
+ * EXPERIMENT (GZ302, patch 0055): the camera's name as applications show it (V4L2 card, e.g. in OBS or a browser's
+ * camera picker). Boards listed here get their product name instead of the driver name: the GZ302 rear camera is
+ * "ASUS 13M AF webcam", the FriendlyName in ASUS's Windows driver (amdcamera_ext.inf, sensorOV13B_ext.inf); its
+ * front camera is "ASUS 5M webcam". Other boards keep ISP4VID_ISP_DRV_NAME.
+ */
+static const struct dmi_system_id isp4vid_card_names[] = {
+	{
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "ASUSTeK COMPUTER INC."),
+			DMI_MATCH(DMI_BOARD_NAME, "GZ302"),
+		},
+		.driver_data = (void *)"ASUS 13M AF webcam",
+	},
+	{ }
+};
 
 /* Sizes must be in increasing order */
 static const struct v4l2_frmsize_discrete isp4vid_frmsize[] = {
@@ -128,9 +147,11 @@ static int isp4vid_ioctl_querycap(struct file *file, void *fh,
 				  struct v4l2_capability *cap)
 {
 	struct isp4vid_dev *isp_vdev = video_drvdata(file);
+	const struct dmi_system_id *board = dmi_first_match(isp4vid_card_names);	/* patch 0055 */
 
 	strscpy(cap->driver, ISP4VID_ISP_DRV_NAME, sizeof(cap->driver));
-	snprintf(cap->card, sizeof(cap->card), "%s", ISP4VID_ISP_DRV_NAME);
+	snprintf(cap->card, sizeof(cap->card), "%s",
+		 board ? (const char *)board->driver_data : ISP4VID_ISP_DRV_NAME);
 	cap->capabilities |= V4L2_CAP_STREAMING | V4L2_CAP_VIDEO_CAPTURE;
 
 	dev_dbg(isp_vdev->dev, "%s|capabilities=0x%X\n", isp_vdev->vdev.name,
@@ -402,6 +423,9 @@ static const struct v4l2_ioctl_ops isp4vid_vdev_ioctl_ops = {
 	.vidioc_s_parm              = isp4vid_ioctl_g_param,
 	.vidioc_enum_framesizes     = isp4vid_enum_framesizes,
 	.vidioc_enum_frameintervals = isp4vid_ioctl_enum_frameintervals,
+	/* patch 0043: control change events for the focus control */
+	.vidioc_subscribe_event     = v4l2_ctrl_subscribe_event,
+	.vidioc_unsubscribe_event   = v4l2_event_unsubscribe,
 };
 
 static unsigned int isp4vid_get_image_size(struct v4l2_pix_format *fmt)
@@ -701,6 +725,22 @@ static const struct vb2_ops isp4vid_qops = {
 	.buf_queue = isp4vid_qops_buffer_queue,
 };
 
+/* EXPERIMENT (GZ302, patch 0043): the focus control moves the lens through the subdev (host I2C) */
+static int isp4vid_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+	switch (ctrl->id) {
+	case V4L2_CID_FOCUS_ABSOLUTE:
+		isp4sd_set_focus(ctrl->val);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static const struct v4l2_ctrl_ops isp4vid_ctrl_ops = {
+	.s_ctrl = isp4vid_s_ctrl,
+};
+
 int isp4vid_dev_init(struct isp4vid_dev *isp_vdev, struct v4l2_subdev *isp_sd)
 {
 	const char *vdev_name = isp4vid_video_dev_name;
@@ -784,15 +824,29 @@ int isp4vid_dev_init(struct isp4vid_dev *isp_vdev, struct v4l2_subdev *isp_sd)
 	strscpy(vdev->name, vdev_name, sizeof(vdev->name));
 	video_set_drvdata(vdev, isp_vdev);
 
+	/* patch 0043: focus_absolute, only when the host-driven focus is enabled */
+	v4l2_ctrl_handler_init(&isp_vdev->ctrl_handler, 1);
+	if (isp4sd_focus_control_enabled())
+		v4l2_ctrl_new_std(&isp_vdev->ctrl_handler, &isp4vid_ctrl_ops,
+				  V4L2_CID_FOCUS_ABSOLUTE, 0, ISP4SD_FOCUS_MAX, 1,
+				  ISP4SD_FOCUS_DEFAULT);
+	if (isp_vdev->ctrl_handler.error) {
+		ret = isp_vdev->ctrl_handler.error;
+		dev_err(v4l2_dev->dev, "control handler init fail:%d\n", ret);
+		goto err_free_ctrls;
+	}
+	vdev->ctrl_handler = &isp_vdev->ctrl_handler;
+
 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
 	if (ret) {
 		dev_err(v4l2_dev->dev, "register video device fail:%d\n", ret);
-		goto err_entity_cleanup;
+		goto err_free_ctrls;
 	}
 
 	return 0;
 
-err_entity_cleanup:
+err_free_ctrls:
+	v4l2_ctrl_handler_free(&isp_vdev->ctrl_handler);
 	media_entity_cleanup(&isp_vdev->vdev.entity);
 err_release_vb2_queue:
 	vb2_queue_release(q);
@@ -802,4 +856,5 @@ err_release_vb2_queue:
 void isp4vid_dev_deinit(struct isp4vid_dev *isp_vdev)
 {
 	vb2_video_unregister_device(&isp_vdev->vdev);
+	v4l2_ctrl_handler_free(&isp_vdev->ctrl_handler);	/* patch 0043 */
 }

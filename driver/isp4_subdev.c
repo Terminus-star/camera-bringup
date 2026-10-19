@@ -3,11 +3,13 @@
  * Copyright (C) 2025 Advanced Micro Devices, Inc.
  */
 
+#include <linux/crc32.h>
 #include <linux/device.h>
 #include <linux/i2c.h>
 #include <linux/moduleparam.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/unaligned.h>
 #include <linux/units.h>
 #include <media/v4l2-subdev.h>
 
@@ -96,8 +98,14 @@ MODULE_PARM_DESC(sensor_pll,
  *   0x10 SET_FPS_RANGE                   {15000, 30000}           after the META buffers, before the preview buffers
  *   0x20 SET_ITIME_RANGE                 {40, 66666} (us)         right after SET_FPS_RANGE
  *   0x40 ENABLE_PREFETCH (GLOBAL, patch 0029) {1, 1, 1}  (INFERRED payload)  after the META buffers, before SET_FPS_RANGE
- * Not included (payload unknown or does not fit the 48-byte command slot): SET_3A_CONFIG (92 bytes, sent
- * "indirect" by Windows), power/clock gating (global commands), SET_M2M_CAL_DATA, SET_ADAPTIVE_RTA.
+ *   0x80 SET_3A_CONFIG (patch 0038, 92 bytes, indirect: isp4if_send_3a_config(); AF mode from af_mode)
+ *        right after the META buffers, before ENABLE_PREFETCH
+ *  0x100 SET_ADAPTIVE_RTA (patch 0041) {0, 3, 3, 3, bytes 01 01 01 00}  right after START_STREAM succeeds
+ *        (Windows' registry defaults MemProfiling / adaptiveRtaType 3 / adaptiveRtaStrength 1,1,1; findings 106)
+ *  0x200 SET_LOG_MODULE_LEVEL (patch 0044, GLOBAL, indirect: isp4if_send_log_levels(); fw_log_mod, fw_log_rta)
+ *        right after the memory pool, before ENABLE_RTA
+ * Not included (payload unknown or does not fit the 48-byte command slot): power/clock gating
+ * (global commands), SET_M2M_CAL_DATA, SET_ADAPTIVE_RTA.
  */
 #define EXP_CMD_ID_ENABLE_RTA			0x02090008
 #define EXP_CMD_ID_APPLY_TUNING_SCENARIO	0x02050009
@@ -114,11 +122,15 @@ MODULE_PARM_DESC(sensor_pll,
 #define EXP_WIN_FPS_RANGE	0x10
 #define EXP_WIN_ITIME_RANGE	0x20
 #define EXP_WIN_PREFETCH	0x40
+#define EXP_WIN_3A_CONFIG	0x80	/* patch 0038 */
+#define EXP_WIN_ADAPTIVE_RTA	0x100	/* patch 0041 */
+#define EXP_WIN_LOG_LEVEL	0x200	/* patch 0044 */
+#define EXP_CMD_ID_SET_ADAPTIVE_RTA		0x0201000c
 
 static unsigned int win_cmds = 0x77;	/* patch 0035: all but scene mode */
 module_param(win_cmds, uint, 0444);
 MODULE_PARM_DESC(win_cmds,
-		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range, 0x40 global ENABLE_PREFETCH (0 = none)");
+		 "EXPERIMENT: bit mask of extra Windows firmware commands: 1 RTA, 2 tuning scenario, 4 out-chan rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime range, 0x40 global ENABLE_PREFETCH, 0x80 SET_3A_CONFIG, 0x100 SET_ADAPTIVE_RTA, 0x200 SET_LOG_MODULE_LEVEL (0 = none)");
 
 /*
  * EXPERIMENT (GZ302, patch 0030): with {1,1,1} the firmware hangs in MMhubPrefetchSingleStream during
@@ -142,8 +154,15 @@ static void isp4sd_exp_win_cmd(struct isp4_subdev *isp_subdev, unsigned int bit,
 		return;
 
 	ret = isp4if_send_command(&isp_subdev->ispif, cmd_id, words, count * sizeof(u32));
-	dev_info(isp_subdev->dev, "EXP-WINCMD: %s (0x%08x) %u payload words %*ph -> ret %d\n",
+	exp_info(isp_subdev->dev, "EXP-WINCMD: %s (0x%08x) %u payload words %*ph -> ret %d\n",
 		 name, cmd_id, count, (int)(count * sizeof(u32)), words, ret);
+}
+
+/* patch 0041: what Windows sends right after a successful START_STREAM (fw_if_set_adaptive_rta) */
+static void isp4sd_exp_after_start_stream(struct isp4_subdev *isp_subdev)
+{
+	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_ADAPTIVE_RTA, EXP_CMD_ID_SET_ADAPTIVE_RTA,
+			   "SET_ADAPTIVE_RTA", (const u32 []){ 0, 3, 3, 3, 0x00010101 }, 5);
 }
 
 static struct device *exp_sensor_dev;		/* reference held while the sensor streams */
@@ -172,7 +191,7 @@ static void isp4sd_exp_i2c_probe(struct device *dev, struct i2c_client *client, 
 	r_rd = i2c_transfer(client->adapter, rd, 2);
 	r_wr = i2c_transfer(client->adapter, &wr, 1);
 
-	dev_info(dev,
+	exp_info(dev,
 		 "EXP-SENSOR: raw I2C (%s) adapter %s addr 0x%02x: chip-id read ret %d (id %02x %02x %02x, want 56 0d 42), write 0x0100=0 ret %d, sensor runtime-active %d\n",
 		 when, client->adapter->name, client->addr, r_rd, id[0], id[1], id[2], r_wr,
 		 pm_runtime_active(&client->dev));
@@ -200,6 +219,155 @@ static int isp4sd_exp_wr8(struct i2c_client *client, u16 reg, u8 val)
 	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
 }
 
+/*
+ * EXPERIMENT (GZ302, patch 0040): focus motor (VCM) init. Windows' sensor plug-in (start_OV13B ->
+ * 0x140004d48) writes two 2-byte frames to the motor at I2C 0x0c at every stream start, with the sensor
+ * powered and before the mode table: DF 5B, then 19 04 (VcmMode 1, the Windows default; = park the lens
+ * at position 400 with the slope bit). Linux never did, and the lens never moved (findings 105, 107).
+ *   vcm_init=0 off (default), 1 = Windows (DF 5B, 19 04), 2 = mode-0 variant (DF 5B, 19 00).
+ */
+#define EXP_VCM_I2C_ADDR	0x0c
+
+static unsigned int vcm_init;
+module_param(vcm_init, uint, 0444);
+MODULE_PARM_DESC(vcm_init,
+		 "EXPERIMENT: init the focus motor at I2C 0x0c like Windows at stream start: 0 off, 1 DF 5B + 19 04 (Windows), 2 DF 5B + 19 00");
+
+/* one 2-byte frame to the motor (8-bit register, 8-bit value), on the sensor's adapter */
+static int isp4sd_exp_vcm_wr(struct i2c_client *client, u8 reg, u8 val)
+{
+	u8 buf[2] = { reg, val };
+	struct i2c_msg msg = { .addr = EXP_VCM_I2C_ADDR, .flags = 0, .len = sizeof(buf), .buf = buf };
+	int ret = i2c_transfer(client->adapter, &msg, 1);
+
+	return ret == 1 ? 0 : (ret < 0 ? ret : -EIO);
+}
+
+/* Caller makes sure the sensor (and so the motor supply) is powered. -ENXIO = the motor did not answer. */
+static void isp4sd_exp_vcm_init(struct device *dev, struct i2c_client *client, const char *when)
+{
+	u8 park = vcm_init == 2 ? 0x00 : 0x04;
+	int r1, r2;
+
+	if (!vcm_init)
+		return;
+	r1 = isp4sd_exp_vcm_wr(client, 0xdf, 0x5b);
+	r2 = isp4sd_exp_vcm_wr(client, 0x19, park);
+	exp_info(dev, "EXP-VCM: init at I2C 0x%02x %s (vcm_init %u): DF 5B -> %d, 19 %02X -> %d\n",
+		 EXP_VCM_I2C_ADDR, when, vcm_init, r1, park, r2);
+}
+
+/*
+ * EXPERIMENT (GZ302, patch 0042): move the lens from the host, bypassing the firmware, to find out
+ * whether the motor itself works (findings 109). Right after s_stream(1) succeeds the host writes one
+ * position frame in the format of the Windows init (mode 1): {pos >> 4 & 0x3f, (pos & 0xf) << 4 | 0x04},
+ * e.g. 400 -> 19 04, 1023 -> 3F F4, 0 -> 00 04. -1 (default) = off.
+ */
+static int vcm_test_pos = -1;
+module_param(vcm_test_pos, int, 0444);
+MODULE_PARM_DESC(vcm_test_pos,
+		 "EXPERIMENT: after s_stream(1), write this lens position 0..1023 to the motor at I2C 0x0c from the host (mode-1 frame); -1 = off");
+
+static void isp4sd_exp_vcm_test(struct device *dev, struct i2c_client *client)
+{
+	unsigned int pos;
+	u8 b1, b2;
+	int ret;
+
+	if (vcm_test_pos < 0)
+		return;
+	pos = min(vcm_test_pos, 1023);
+	b1 = (pos >> 4) & 0x3f;
+	b2 = ((pos & 0xf) << 4) | 0x04;
+	ret = isp4sd_exp_vcm_wr(client, b1, b2);
+	exp_info(dev, "EXP-VCM: host test write, position %u: %02X %02X -> %d\n", pos, b1, b2, ret);
+}
+
+/*
+ * EXPERIMENT (GZ302, patch 0043): host-driven manual focus behind V4L2_CID_FOCUS_ABSOLUTE.
+ * At every sensor start: Windows' motor init (DF 5B) and then the current position as a mode-1 frame
+ * (with the default 400 that is 19 04, i.e. exactly what Windows sends). While the sensor streams, a
+ * control change is written to the motor at once. exp_focus_lock serialises control changes against
+ * sensor start/stop; exp_focus_client is only set while the sensor is powered and streaming.
+ */
+static bool focus_control = true;
+module_param(focus_control, bool, 0444);
+MODULE_PARM_DESC(focus_control,
+		 "EXPERIMENT: manual focus control (V4L2 focus_absolute 0..1023) written to the motor by the host; replaces vcm_init (default on)");
+
+/*
+ * patch 0045: while the firmware streams, the host must not use the shared I2C controller (it
+ * corrupts the sensor, findings 114); live focus changes then go through the firmware with
+ * SEND_I2C_MSG. 0 = old direct host write (unsafe while streaming, for comparison only).
+ */
+static bool focus_via_fw = true;
+module_param(focus_via_fw, bool, 0444);
+MODULE_PARM_DESC(focus_via_fw,
+		 "EXPERIMENT: live focus changes while streaming go through the firmware (SEND_I2C_MSG) instead of the host I2C controller (default on)");
+
+static DEFINE_MUTEX(exp_focus_lock);
+static u32 exp_focus_pos = ISP4SD_FOCUS_DEFAULT;
+static struct i2c_client *exp_focus_client;
+static struct isp4_interface *exp_focus_ispif;	/* patch 0045 */
+
+static int isp4sd_exp_focus_write(struct i2c_client *client, u32 pos)
+{
+	return isp4sd_exp_vcm_wr(client, (pos >> 4) & 0x3f, ((pos & 0xf) << 4) | 0x04);
+}
+
+bool isp4sd_focus_control_enabled(void)
+{
+	return focus_control;
+}
+
+void isp4sd_set_focus(s32 pos)
+{
+	int ret;
+
+	mutex_lock(&exp_focus_lock);
+	exp_focus_pos = clamp(pos, 0, ISP4SD_FOCUS_MAX);
+	if (exp_focus_client && focus_via_fw && exp_focus_ispif) {
+		/* patch 0045: mode-1 frame {pos >> 4 & 0x3f, (pos & 0xf) << 4 | 4} as register + data */
+		ret = isp4if_fw_i2c_write(exp_focus_ispif, EXP_VCM_I2C_ADDR, (exp_focus_pos >> 4) & 0x3f,
+					  ((exp_focus_pos & 0xf) << 4) | 0x04);
+		if (ret)
+			dev_warn(&exp_focus_client->dev, "EXP-FOCUS: firmware I2C write of position %u failed: %d\n",
+				 exp_focus_pos, ret);
+		else
+			dev_dbg(&exp_focus_client->dev, "EXP-FOCUS: position %u via firmware\n", exp_focus_pos);
+	} else if (exp_focus_client) {
+		ret = isp4sd_exp_focus_write(exp_focus_client, exp_focus_pos);
+		dev_dbg(&exp_focus_client->dev, "EXP-FOCUS: position %u -> %d\n", exp_focus_pos, ret);
+	}
+	mutex_unlock(&exp_focus_lock);
+}
+
+/* Sensor powered (caller's responsibility): motor init + current position; else the old vcm_init. */
+static void isp4sd_exp_focus_start(struct device *dev, struct i2c_client *client, const char *when)
+{
+	int r1, r2;
+
+	if (!focus_control) {
+		isp4sd_exp_vcm_init(dev, client, when);
+		return;
+	}
+	mutex_lock(&exp_focus_lock);
+	r1 = isp4sd_exp_vcm_wr(client, 0xdf, 0x5b);
+	r2 = isp4sd_exp_focus_write(client, exp_focus_pos);
+	mutex_unlock(&exp_focus_lock);
+	exp_info(dev, "EXP-FOCUS: motor init %s: DF 5B -> %d, position %u -> %d\n",
+		 when, r1, exp_focus_pos, r2);
+}
+
+/* from now on control changes go straight to the motor (NULL = sensor stopped) */
+static void isp4sd_exp_focus_attach(struct i2c_client *client, struct isp4_interface *ispif)
+{
+	mutex_lock(&exp_focus_lock);
+	exp_focus_client = focus_control ? client : NULL;
+	exp_focus_ispif = exp_focus_client ? ispif : NULL;	/* patch 0045 */
+	mutex_unlock(&exp_focus_lock);
+}
+
 /* PLL, stream and MIPI timing registers that differ or matter between the Windows and Linux tables */
 static const u16 exp_pll_regs[] = {
 	0x0100, 0x0303, 0x0305, 0x0321, 0x0323, 0x0324, 0x0325, 0x0326, 0x0327, 0x3011, 0x4800, 0x4837,
@@ -220,7 +388,7 @@ static void isp4sd_exp_pll_dump(struct device *dev, struct i2c_client *client, c
 		else
 			n += scnprintf(line + n, sizeof(line) - n, " 0x%04x=%02x", exp_pll_regs[i], v);
 	}
-	dev_info(dev, "EXP-SENSOR: PLL regs (%s):%s\n", when, line);
+	exp_info(dev, "EXP-SENSOR: PLL regs (%s):%s\n", when, line);
 }
 
 /*
@@ -269,11 +437,11 @@ static int isp4sd_exp_pll_apply_windows(struct device *dev, struct i2c_client *c
 				return ret;
 			}
 		}
-		dev_info(dev, "EXP-SENSOR: applied the Windows mode registers (0x3813=08 0x3600=1a 0x380f=94 0x3011=7c 0x3774=2d 0x3823=18 0x3827=01)\n");
+		exp_info(dev, "EXP-SENSOR: applied the Windows mode registers (0x3813=08 0x3600=1a 0x380f=94 0x3011=7c 0x3774=2d 0x3823=18 0x3827=01)\n");
 	}
 	usleep_range(5000, 6000);		/* PLL lock */
 	ret = isp4sd_exp_wr8(client, 0x0100, 0x01);	/* stream on */
-	dev_info(dev, "EXP-SENSOR: applied the Windows PLL values (0x0303=01 0x0305=46 0x0325=55), stream on -> %d\n", ret);
+	exp_info(dev, "EXP-SENSOR: applied the Windows PLL values (0x0303=01 0x0305=46 0x0325=55), stream on -> %d\n", ret);
 	return ret;
 }
 
@@ -298,7 +466,7 @@ static void isp4sd_exp_burst_fn(struct work_struct *work)
 	int ret = exp_burst_client ? isp4sd_exp_wr8(exp_burst_client, 0x0100, 0x00) : -ENODEV;
 
 	if (exp_burst_log_dev)
-		dev_info(exp_burst_log_dev, "EXP-SENSOR: burst limit: sensor put into software standby after %u ms -> %d\n",
+		exp_info(exp_burst_log_dev, "EXP-SENSOR: burst limit: sensor put into software standby after %u ms -> %d\n",
 			 sensor_burst_ms, ret);
 }
 
@@ -345,7 +513,7 @@ static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *i
 		isp4sd_exp_i2c_probe(dev, client, "before pm cycle");
 		r_susp = pm_runtime_force_suspend(&client->dev);
 		r_res = pm_runtime_force_resume(&client->dev);
-		dev_info(dev, "EXP-SENSOR: forced runtime PM cycle of the sensor: suspend %d, resume %d, runtime-active %d\n",
+		exp_info(dev, "EXP-SENSOR: forced runtime PM cycle of the sensor: suspend %d, resume %d, runtime-active %d\n",
 			 r_susp, r_res, pm_runtime_active(&client->dev));
 		isp4sd_exp_i2c_probe(dev, client, "after pm cycle");
 	}
@@ -358,13 +526,24 @@ static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *i
 	 */
 	if (isp4if_phy_init_enabled()) {
 		pm_ref = pm_runtime_resume_and_get(&client->dev);
-		dev_info(dev, "EXP-SENSOR: powered the sensor for the PHY start: %d\n", pm_ref);
+		exp_info(dev, "EXP-SENSOR: powered the sensor for the PHY start: %d\n", pm_ref);
 		ret = isp4if_phy_init(ispif);
-		dev_info(dev, "EXP-SENSOR: PHY start returned %d\n", ret);
+		exp_info(dev, "EXP-SENSOR: PHY start returned %d\n", ret);
 	}
 
+	/* patch 0040: like Windows, with the sensor powered and before it streams (needs the PM reference) */
+	if (pm_ref >= 0)
+		isp4sd_exp_focus_start(dev, client, "before s_stream");	/* patch 0043 */
+
 	ret = v4l2_subdev_call(sd, video, s_stream, 1);
-	dev_info(dev, "EXP-SENSOR: %s s_stream(1) %s START_STREAM -> %d\n", sd->name, when, ret);
+	exp_info(dev, "EXP-SENSOR: %s s_stream(1) %s START_STREAM -> %d\n", sd->name, when, ret);
+	/* patch 0040: without the PHY start's PM reference, init the motor once the sensor is powered by s_stream */
+	if (!ret && pm_ref < 0)
+		isp4sd_exp_focus_start(dev, client, "after s_stream");	/* patch 0043 */
+	if (!ret)
+		isp4sd_exp_vcm_test(dev, client);	/* patch 0042 */
+	if (!ret)
+		isp4sd_exp_focus_attach(client, ispif);	/* patch 0043, 0045 */
 	if (!ret && sensor_pll) {
 		/* patch 0025: what the sensor really got, and optionally the Windows PLL values */
 		isp4sd_exp_pll_dump(dev, client, "after s_stream");
@@ -376,7 +555,7 @@ static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *i
 		exp_burst_client = client;
 		exp_burst_log_dev = dev;
 		schedule_delayed_work(&exp_burst_work, msecs_to_jiffies(sensor_burst_ms));
-		dev_info(dev, "EXP-SENSOR: burst limit armed: sensor standby in %u ms\n", sensor_burst_ms);
+		exp_info(dev, "EXP-SENSOR: burst limit armed: sensor standby in %u ms\n", sensor_burst_ms);
 	}
 	if (!ret && isp4if_phy_init_enabled() && phy_diag) {	/* patch 0034: phy_diag=0 skips the sleeps */
 		/* patch 0022: D-PHY state right after, 100 ms and 1 s after the sensor started streaming */
@@ -398,6 +577,8 @@ static void isp4sd_exp_sensor_start(struct device *dev, struct isp4_interface *i
 	exp_sensor_sd = sd;
 }
 
+static void isp4sd_exp_af_cancel(void);	/* patch 0050, defined with the AF drive below */
+
 static void isp4sd_exp_sensor_stop(struct device *dev)
 {
 	int ret;
@@ -409,8 +590,10 @@ static void isp4sd_exp_sensor_stop(struct device *dev)
 	if (!exp_sensor_dev)
 		return;
 
+	isp4sd_exp_af_cancel();			/* patch 0050: no AF write in flight past this point */
+	isp4sd_exp_focus_attach(NULL, NULL);	/* patch 0043: no motor writes once the sensor stops */
 	ret = v4l2_subdev_call(exp_sensor_sd, video, s_stream, 0);
-	dev_info(dev, "EXP-SENSOR: %s s_stream(0) -> %d\n", exp_sensor_sd->name, ret);
+	exp_info(dev, "EXP-SENSOR: %s s_stream(0) -> %d\n", exp_sensor_sd->name, ret);
 	put_device(exp_sensor_dev);
 	exp_sensor_dev = NULL;
 	exp_sensor_sd = NULL;
@@ -461,6 +644,213 @@ MODULE_PARM_DESC(meta_data_resend,
 		 "EXPERIMENT: re-send one type-13 META_DATA buffer (round-robin) after every frame-done, like Windows");
 
 static unsigned int exp_meta_data_next;	/* next META_DATA buffer to re-send */
+
+/*
+ * EXPERIMENT (GZ302, patch 0049): the firmware's per-frame AF state, read-only (findings 124/125). Windows'
+ * isp_fw_resp_frame_done (amdcamera.sys 0x14001211c) reads, when meta-info word 0x108 is non-zero, a 3A result
+ * buffer whose GPU address is the u64 at meta-info byte 0x45c, and logs from it +0x88 (AF state), +0x110 (the
+ * value that steps 256 -> 1856 during Windows' AF scan; INFERENCE: lens target 0..4095) and +0x70, +0xa0, +0xa4,
+ * +0xbc (float, printed as hex), +0xc0, +0xe8, +0x11c, +0x174 (meaning unknown). INFERENCE: that buffer is one of
+ * our META_DATA (type 13) buffers; the log says which one, or "not ours".
+ *   af_meta_log=N logs the first N frames of every stream (0 = off, default).
+ */
+static unsigned int af_meta_log;
+module_param(af_meta_log, uint, 0444);
+MODULE_PARM_DESC(af_meta_log,
+		 "EXPERIMENT: log the firmware's AF state and lens target from the 3A result buffer for the first N frames of each stream (0 = off)");
+
+static unsigned int exp_af_meta_frames;	/* frames logged in this stream */
+
+/* the 3A result buffer this frame's meta info points to, if it is one of ours (index in *idx); else NULL */
+static const u8 *isp4sd_exp_3a_buf(const void *meta_info, unsigned int *idx)
+{
+	const u8 *mi = meta_info;
+	u64 addr = get_unaligned_le64(mi + 0x45c);
+	unsigned int i;
+
+	for (i = 0; i < exp_meta_data_cnt; i++) {
+		if (exp_meta_data[i].gpu_addr == addr) {
+			*idx = i;
+			return exp_meta_data[i].cpu_addr;
+		}
+	}
+	return NULL;
+}
+
+static void isp4sd_exp_af_meta_log(struct device *dev, const void *meta_info)
+{
+	const u8 *mi = meta_info, *d;
+	u32 valid = get_unaligned_le32(mi + 0x108 * 4);
+	u64 addr = get_unaligned_le64(mi + 0x45c);
+	unsigned int i = 0;
+
+	if (exp_af_meta_frames >= af_meta_log)
+		return;
+	exp_af_meta_frames++;
+	d = isp4sd_exp_3a_buf(meta_info, &i);
+	if (!valid || !d) {
+		exp_info(dev, "EXP-AFMETA: poc %u: word 0x108 = %u, 3A buffer 0x%llx %s\n",
+			 get_unaligned_le32(mi), valid, addr, d ? "" : "(not one of our META_DATA buffers)");
+		return;
+	}
+	exp_info(dev, "EXP-AFMETA: poc %u buf %u: af_state %u lens %u | 70 %u a0 %u a4 %u bc %08x c0 %u e8 %u 11c %u 174 %u\n",
+		 get_unaligned_le32(mi), i, get_unaligned_le32(d + 0x88), get_unaligned_le32(d + 0x110),
+		 get_unaligned_le32(d + 0x70), get_unaligned_le32(d + 0xa0), get_unaligned_le32(d + 0xa4),
+		 get_unaligned_le32(d + 0xbc), get_unaligned_le32(d + 0xc0), get_unaligned_le32(d + 0xe8),
+		 get_unaligned_le32(d + 0x11c), get_unaligned_le32(d + 0x174));
+}
+
+/*
+ * EXPERIMENT (GZ302, patch 0050): close the AF loop on the host (findings 126). The firmware's AF computes a
+ * lens target every frame (3A result +0x110, 0..4095) but never writes the motor. af_drive=1 takes that target
+ * at frame-done, converts it to the motor scale (/4, 0..1023, as the firmware's own "virtual position(4092) ->
+ * hw_position (1023)") and, when it changed, writes it through isp4sd_set_focus() (firmware I2C while
+ * streaming, patch 0045). The write is a sync stream command whose answer comes on this same response thread,
+ * so it runs from a work item; a newer target replaces one not yet written. Default 0 = off; while on, the AF
+ * owns the lens (focus_absolute changes are overwritten by the next target).
+ */
+static unsigned int af_drive;	/* patch 0052: 0 off, 1 firmware target (0050/0051), 2 host PDAF servo */
+module_param(af_drive, uint, 0444);
+MODULE_PARM_DESC(af_drive,
+		 "EXPERIMENT: drive the focus motor via firmware I2C: 0 off (default), 1 the firmware's AF target, 2 host servo on the firmware's phase-detection defocus (interim fix)");
+
+static int exp_af_pending = -1;		/* motor position to write, -1 = none (xchg) */
+static int exp_af_last = -1;		/* last position queued in this stream */
+
+static void isp4sd_exp_af_work_fn(struct work_struct *work)
+{
+	int pos = xchg(&exp_af_pending, -1);
+
+	if (pos >= 0)
+		isp4sd_set_focus(pos);
+}
+
+static DECLARE_WORK(exp_af_work, isp4sd_exp_af_work_fn);
+
+/*
+ * EXPERIMENT (GZ302, patch 0051): the AF target is on the firmware's algorithm scale (0..4095); patch 0050's /4
+ * overdrove the lens (findings 128). Algorithm -> Real: piecewise-linear through the six pairs the AF library
+ * prints for this module (findings 128). Real -> motor code: a line through two MEASURED anchors from the lens
+ * sweeps (findings 130): Real 940 (infinity) -> af_inf_code, Real 2220 (macro) -> af_macro_code; the firmware's
+ * own Real/4 is about 2x too steep toward macro. The code is clamped to [af_inf_code - 50, af_macro_code + 60].
+ */
+static int af_inf_code = 248;
+module_param(af_inf_code, int, 0444);
+MODULE_PARM_DESC(af_inf_code, "EXPERIMENT: motor code for infinity focus (firmware Real 940), measured 248");
+
+static int af_macro_code = 407;
+module_param(af_macro_code, int, 0444);
+MODULE_PARM_DESC(af_macro_code, "EXPERIMENT: motor code for macro focus (firmware Real 2220), from the measured slope 407");
+
+static const u16 exp_af_alg[] = { 0, 755, 1063, 3668, 3805, 4095 };
+static const u16 exp_af_real[] = { 700, 860, 940, 2220, 2348, 2620 };
+
+static int isp4sd_exp_af_alg_to_real(u32 alg)
+{
+	unsigned int i = 1;
+
+	alg = min(alg, 4095U);
+	while (i < ARRAY_SIZE(exp_af_alg) - 1 && alg > exp_af_alg[i])
+		i++;
+	return exp_af_real[i - 1] + (int)(alg - exp_af_alg[i - 1]) * (exp_af_real[i] - exp_af_real[i - 1]) /
+	       (exp_af_alg[i] - exp_af_alg[i - 1]);
+}
+
+/* the lens's useful range from the two anchors (patch 0051); shared with the servo of patch 0052 */
+static int isp4sd_exp_af_clamp(int code)
+{
+	return clamp(code, max(af_inf_code - 50, 0), min(af_macro_code + 60, ISP4SD_FOCUS_MAX));
+}
+
+static int isp4sd_exp_af_real_to_code(int real)
+{
+	return isp4sd_exp_af_clamp(af_inf_code + (real - 940) * (af_macro_code - af_inf_code) / (2220 - 940));
+}
+
+/*
+ * EXPERIMENT (GZ302, patch 0052), INTERIM FIX: af_drive=2. On Windows the firmware moves the lens itself; on Linux
+ * its move step never runs and it keeps believing the lens has not moved, so its target settles short of focus
+ * (findings 132). Its phase-detection defocus (3A result +0xe8, s32) is measured from the image and is right
+ * wherever the lens is: positive below focus, negative past it, about -2.6 per motor code near focus. So the host
+ * moves the lens itself: every second frame (the lens moves and the next measurement must see it), after the first
+ * 8 frames (Windows' AF starts at frame 9; the first readings jump while exposure ramps up),
+ *   code += defocus / af_pd_div, limited to +-af_pd_max_step, no move while |defocus| < af_pd_deadband,
+ * clamped to the lens range. Starts from the current focus_absolute position. The firmware's AF state stays
+ * meaningless (it still thinks the lens never moved); its low-texture fallback is not used.
+ */
+static unsigned int af_pd_div = 6;
+module_param(af_pd_div, uint, 0444);
+MODULE_PARM_DESC(af_pd_div, "EXPERIMENT: af_drive=2: lens step = defocus / af_pd_div (default 6, ~40% of the error per step)");
+
+static unsigned int af_pd_max_step = 25;
+module_param(af_pd_max_step, uint, 0444);
+MODULE_PARM_DESC(af_pd_max_step, "EXPERIMENT: af_drive=2: largest lens step in motor codes (default 25)");
+
+static unsigned int af_pd_deadband = 15;
+module_param(af_pd_deadband, uint, 0444);
+MODULE_PARM_DESC(af_pd_deadband, "EXPERIMENT: af_drive=2: no move while |defocus| is below this (default 15)");
+
+static unsigned int exp_af_frames;	/* frames seen by the servo in this stream */
+
+/* returns the new motor code, or -1 for "no move this frame" */
+static int isp4sd_exp_af_servo(struct device *dev, const void *meta_info, const u8 *d)
+{
+	s32 defocus = (s32)get_unaligned_le32(d + 0xe8);
+	int step;
+
+	if (exp_af_last < 0)
+		exp_af_last = READ_ONCE(exp_focus_pos);
+	exp_af_frames++;
+	if (exp_af_frames <= 8 || (exp_af_frames & 1))
+		return -1;
+	if (abs(defocus) < af_pd_deadband)
+		return -1;
+	step = clamp(defocus / (int)max(af_pd_div, 1U), -(int)af_pd_max_step, (int)af_pd_max_step);
+	if (!step)
+		return -1;
+	exp_info(dev, "EXP-AF: poc %u: defocus %d -> code %d -> %d\n", get_unaligned_le32(meta_info), defocus,
+		 exp_af_last, isp4sd_exp_af_clamp(exp_af_last + step));
+	return isp4sd_exp_af_clamp(exp_af_last + step);
+}
+
+static void isp4sd_exp_af_cancel(void)
+{
+	cancel_work_sync(&exp_af_work);
+	exp_af_pending = -1;
+}
+
+static void isp4sd_exp_af_drive(struct device *dev, const void *meta_info)
+{
+	unsigned int idx;
+	const u8 *d;
+	int real, pos;
+	u32 alg;
+
+	if (!af_drive || !get_unaligned_le32((const u8 *)meta_info + 0x108 * 4))
+		return;
+	d = isp4sd_exp_3a_buf(meta_info, &idx);
+	if (!d)
+		return;
+	if (af_drive == 2) {				/* patch 0052 */
+		pos = isp4sd_exp_af_servo(dev, meta_info, d);
+		if (pos < 0 || pos == exp_af_last)
+			return;
+		exp_af_last = pos;
+		xchg(&exp_af_pending, pos);
+		schedule_work(&exp_af_work);
+		return;
+	}
+	alg = get_unaligned_le32(d + 0x110);
+	real = isp4sd_exp_af_alg_to_real(alg);		/* patch 0051 */
+	pos = isp4sd_exp_af_real_to_code(real);
+	if (pos == exp_af_last)
+		return;
+	exp_info(dev, "EXP-AF: poc %u: AF state %u, target %u -> real %d -> motor %d\n",
+		 get_unaligned_le32(meta_info), get_unaligned_le32(d + 0x88), alg, real, pos);
+	exp_af_last = pos;
+	xchg(&exp_af_pending, pos);
+	schedule_work(&exp_af_work);
+}
 
 static void isp4sd_exp_meta_data_free(void)
 {
@@ -603,8 +993,11 @@ static int isp4sd_send_meta_buf(struct isp4_subdev *isp_subdev)
 				return ret;
 			}
 		}
-		dev_info(dev, "EXP: sent %u type-13 META_DATA buffers of 0x%x bytes\n", want, EXP_META_DATA_BUF_SIZE);
+		exp_info(dev, "EXP: sent %u type-13 META_DATA buffers of 0x%x bytes\n", want, EXP_META_DATA_BUF_SIZE);
 		exp_meta_data_next = 0;		/* patch 0034: round-robin re-send starts at the first buffer */
+		exp_af_meta_frames = 0;		/* patch 0049: log the first frames of every stream */
+		exp_af_last = -1;		/* patch 0050: first AF target of the stream is always written */
+		exp_af_frames = 0;		/* patch 0052: servo frame count restarts */
 		memset(&buf_type, 0, sizeof(buf_type));
 	}
 
@@ -699,6 +1092,10 @@ static int isp4sd_kickoff_stream(struct isp4_subdev *isp_subdev, u32 w, u32 h)
 		return -EINVAL;
 	}
 
+	/* EXPERIMENT (patch 0038): Windows sends its 3A setup (AE/AWB/AF modes) right after the META buffers */
+	if (win_cmds & EXP_WIN_3A_CONFIG)
+		isp4if_send_3a_config(ispif);
+
 	/* EXPERIMENT (patch 0029): Windows enables MMHUB prefetch (global command) before the fps range */
 	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_PREFETCH, EXP_CMD_ID_ENABLE_PREFETCH, "ENABLE_PREFETCH",
 			   (const u32 []){ prefetch_flags & 1, (prefetch_flags >> 1) & 1,
@@ -727,8 +1124,9 @@ static int isp4sd_kickoff_stream(struct isp4_subdev *isp_subdev, u32 w, u32 h)
 			return ret;
 		}
 
-		dev_info(dev, "EXP: START_STREAM queued to fw (kickoff), buf_sent %u, min %u\n",
+		exp_info(dev, "EXP: START_STREAM queued to fw (kickoff), buf_sent %u, min %u\n",
 			 sensor_info->buf_sent_cnt, min_start_bufs);
+		isp4sd_exp_after_start_stream(isp_subdev);	/* patch 0041 */
 		isp4if_dump_rings(ispif, "after START_STREAM queued (kickoff)");
 		sensor_info->start_stream_cmd_sent = true;
 		if (start_sensor == 1)
@@ -849,6 +1247,169 @@ static int isp4sd_setup_output(struct isp4_subdev *isp_subdev,
 	return 0;
 }
 
+/*
+ * EXPERIMENT (GZ302, patch 0047): module calibration (M2M) data, step 1: read it. Windows' sensor plug-in
+ * (get_m2m_data_strix_OV13B, sensorOV13B.sys 0x1400039c0; findings 120) reads 0x1b8c bytes of the camera
+ * module's memory (I2C 0x50, 16-bit offsets; INFERENCE: an EEPROM) in three parts, each CRC-32 checked:
+ *   0x00 header (0x20 bytes, CRC at +0x1c), 0x20 header 2 (0x2c bytes, CRC at +0x48: five u16 block sizes at
+ *   +0x28/+0x2c/+0x30/+0x34/+0x38, flags at +0x22..+0x24), 0x4c the blocks (each ends in its CRC-32).
+ * It caches the result and sends it to the firmware as SET_M2M_CAL_DATA (step 2, not here). We have never
+ * sent it; the firmware logs "No valid AF calibration data" and an AWB calibration error.
+ *   m2m_read=0 off, 1 read once + check the CRCs (EXP-M2M lines; default since patch 0054), 2 also hex-dump it.
+ * The read happens before START_STREAM, while the firmware does not use the I2C bus.
+ */
+#define EXP_M2M_I2C_ADDR	0x50
+#define EXP_M2M_SIZE		0x1b8c
+#define EXP_M2M_CHUNK		256
+
+static unsigned int m2m_read = 1;	/* patch 0054: on by default, like Windows (findings 122, 123, 140) */
+module_param(m2m_read, uint, 0444);
+MODULE_PARM_DESC(m2m_read,
+		 "EXPERIMENT: read the camera module calibration (I2C 0x50) before the stream starts: 0 off, 1 read + CRC check (default), 2 also hex dump");
+
+static u8 exp_m2m_buf[EXP_M2M_SIZE];	/* cached after the first read, like Windows */
+static bool exp_m2m_done;
+
+/* one read at a 16-bit offset: write the offset (big-endian), then read len bytes */
+static int isp4sd_exp_m2m_rd(struct i2c_client *client, u16 off, u8 *buf, u16 len)
+{
+	u8 addr[2] = { off >> 8, off & 0xff };
+	struct i2c_msg msgs[2] = {
+		{ .addr = EXP_M2M_I2C_ADDR, .flags = 0, .len = sizeof(addr), .buf = addr },
+		{ .addr = EXP_M2M_I2C_ADDR, .flags = I2C_M_RD, .len = len, .buf = buf },
+	};
+	int ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+
+	return ret == ARRAY_SIZE(msgs) ? 0 : (ret < 0 ? ret : -EIO);
+}
+
+/* Windows' checksum: standard CRC-32 (as zlib), over an even number of bytes */
+static u32 isp4sd_exp_m2m_crc(const u8 *p, u32 len)
+{
+	return ~crc32_le(~0U, p, len & ~1U);
+}
+
+static void isp4sd_exp_m2m_check(struct device *dev, const u8 *b)
+{
+	static const u8 size_off[5] = { 0x28, 0x2c, 0x30, 0x34, 0x38 };
+	u32 off = 0x4c, total = 0;
+	unsigned int i;
+
+	exp_info(dev, "EXP-M2M: header %*ph\n", 0x20, b);
+	exp_info(dev, "EXP-M2M: header CRC %08x, stored %08x; header 2 CRC %08x, stored %08x\n",
+		 isp4sd_exp_m2m_crc(b, 0x1c), get_unaligned_le32(b + 0x1c),
+		 isp4sd_exp_m2m_crc(b + 0x20, 0x28), get_unaligned_le32(b + 0x48));
+	for (i = 0; i < ARRAY_SIZE(size_off); i++)
+		total += get_unaligned_le16(b + size_off[i]);
+	exp_info(dev, "EXP-M2M: flags +0x22..+0x24 = %02x %02x %02x, block sizes %u %u %u %u %u (total %u, max %u)\n",
+		 b[0x22], b[0x23], b[0x24],
+		 get_unaligned_le16(b + 0x28), get_unaligned_le16(b + 0x2c), get_unaligned_le16(b + 0x30),
+		 get_unaligned_le16(b + 0x34), get_unaligned_le16(b + 0x38), total, EXP_M2M_SIZE - 0x4c);
+	if (!total || total > EXP_M2M_SIZE - 0x4c)
+		return;
+	for (i = 0; i < ARRAY_SIZE(size_off); i++) {
+		u32 sz = get_unaligned_le16(b + size_off[i]);
+
+		if (sz >= 4)
+			exp_info(dev, "EXP-M2M: block %u at 0x%04x, %u bytes: CRC %08x, stored %08x\n", i, off, sz,
+				 isp4sd_exp_m2m_crc(b + off, sz - 4), get_unaligned_le32(b + off + sz - 4));
+		off += sz;
+	}
+}
+
+static void isp4sd_exp_m2m_read(struct device *dev)
+{
+	struct device *sdev;
+	struct i2c_client *client;
+	int ret = 0, pm;
+	u32 off;
+
+	if (!m2m_read || exp_m2m_done)
+		return;
+	sdev = bus_find_device_by_name(&i2c_bus_type, NULL, EXP_SENSOR_I2C_NAME);
+	client = sdev ? i2c_verify_client(sdev) : NULL;
+	if (!client) {
+		dev_err(dev, "EXP-M2M: no I2C device %s\n", EXP_SENSOR_I2C_NAME);
+		goto out;
+	}
+
+	pm = pm_runtime_resume_and_get(&client->dev);	/* the module memory shares the sensor's supply */
+	for (off = 0; off < EXP_M2M_SIZE && !ret; off += EXP_M2M_CHUNK)
+		ret = isp4sd_exp_m2m_rd(client, off, exp_m2m_buf + off, min_t(u32, EXP_M2M_SIZE - off, EXP_M2M_CHUNK));
+	if (pm >= 0)
+		pm_runtime_put(&client->dev);
+	exp_info(dev, "EXP-M2M: read %u bytes from I2C 0x%02x (sensor power ref %d) -> %d\n",
+		 EXP_M2M_SIZE, EXP_M2M_I2C_ADDR, pm, ret);
+	if (ret)
+		goto out;
+
+	exp_m2m_done = true;
+	isp4sd_exp_m2m_check(dev, exp_m2m_buf);
+	if (m2m_read >= 2)
+		print_hex_dump(KERN_INFO, "EXP-M2M-DUMP: ", DUMP_PREFIX_OFFSET, 32, 1,
+			       exp_m2m_buf, EXP_M2M_SIZE, false);
+out:
+	put_device(sdev);
+}
+
+/*
+ * EXPERIMENT (GZ302, patch 0048): module calibration, step 2: send it. The 0x2180-byte SET_M2M_CAL_DATA
+ * payload is built from the EEPROM as Windows' isp_set_m2m_calib_2_fw (amdcamera.sys 0x140018fbc) does
+ * (findings 121; checked offline: same checksum as Windows on this laptop, 0x6994265e):
+ *   +0x00 sensor id (0); +0x04 EEPROM 0x00..0x8e; +0x94 EEPROM 0x8e..0x98 (2-byte gap at +0x92);
+ *   +0xa0 lens shading: packed (flag +0x22 = 1): 0x672 x 3 bytes -> two signed 12-bit values each, stored
+ *   as s16 (isp_convert_lsc_to_unpacked), then CRC-32 of +0x84..+0x1a68 at +0x1a68; unpacked: 0x19cc bytes
+ *   copied; +0x1a6c AWB calibration (0x2c, flag +0x23); +0x1a98 AF calibration (0x6e6, flag +0x24).
+ * m2m_send=1 (default since patch 0054) sends it after the read (needs m2m_read >= 1), before APPLY_TUNING_SCENARIO.
+ */
+#define EXP_M2M_FW_SIZE		0x2180
+
+static bool m2m_send = true;	/* patch 0054: on by default, like Windows */
+module_param(m2m_send, bool, 0444);
+MODULE_PARM_DESC(m2m_send,
+		 "EXPERIMENT: send the module calibration to the firmware (SET_M2M_CAL_DATA) like Windows; needs m2m_read >= 1 (default on)");
+
+static u8 exp_m2m_fw[EXP_M2M_FW_SIZE];
+
+static void isp4sd_exp_m2m_build(const u8 *cal, u8 *out)
+{
+	bool packed = cal[0x22] == 1;
+	const u8 *p = cal + 0x98;
+	unsigned int i;
+
+	memset(out, 0, EXP_M2M_FW_SIZE);
+	put_unaligned_le32(0, out);			/* sensor id: 0 for sensor 0 */
+	memcpy(out + 0x04, cal, 0x8e);
+	memcpy(out + 0x94, cal + 0x8e, 0x0a);
+	if (packed) {
+		for (i = 0; i < 0x672; i++, p += 3) {
+			put_unaligned_le16(sign_extend32((p[0] << 4) | (p[1] >> 4), 11), out + 0xa0 + 4 * i);
+			put_unaligned_le16(sign_extend32(((p[1] & 0xf) << 8) | p[2], 11), out + 0xa2 + 4 * i);
+		}
+		put_unaligned_le32(isp4sd_exp_m2m_crc(out + 0x84, 0x19e4), out + 0x1a68);
+	} else {
+		memcpy(out + 0xa0, p, 0x19cc);
+	}
+	if (cal[0x23] == 1)
+		memcpy(out + 0x1a6c, cal + (packed ? 0x13f4 : 0x1a64), 0x2c);
+	if (cal[0x24] == 1)
+		memcpy(out + 0x1a98, cal + (packed ? 0x1420 : 0x1a90), 0x6e6);
+}
+
+static void isp4sd_exp_m2m_send(struct isp4_subdev *isp_subdev)
+{
+	if (!m2m_send)
+		return;
+	if (!exp_m2m_done) {
+		dev_warn(isp_subdev->dev, "EXP-M2M: m2m_send needs a good read (m2m_read=1); not sent\n");
+		return;
+	}
+	isp4sd_exp_m2m_build(exp_m2m_buf, exp_m2m_fw);
+	exp_info(isp_subdev->dev, "EXP-M2M: SET_M2M_CAL_DATA payload built, flags %02x %02x %02x (expect checksum 0x6994265e on the tested GZ302)\n",
+		 exp_m2m_buf[0x22], exp_m2m_buf[0x23], exp_m2m_buf[0x24]);
+	isp4if_send_m2m_cal(&isp_subdev->ispif, exp_m2m_fw, EXP_M2M_FW_SIZE);
+}
+
 static int isp4sd_init_stream(struct isp4_subdev *isp_subdev)
 {
 	struct device *dev = isp_subdev->dev;
@@ -859,6 +1420,10 @@ static int isp4sd_init_stream(struct isp4_subdev *isp_subdev)
 		dev_err(dev, "fail to setup fw mem pool\n");
 		return ret;
 	}
+
+	/* EXPERIMENT (patch 0044): Windows sets the firmware log levels first */
+	if (win_cmds & EXP_WIN_LOG_LEVEL)
+		isp4if_send_log_levels(&isp_subdev->ispif);
 
 	/* EXPERIMENT (patch 0028): Windows sends ENABLE_RTA right after the memory pool */
 	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_RTA, EXP_CMD_ID_ENABLE_RTA, "ENABLE_RTA",
@@ -872,6 +1437,10 @@ static int isp4sd_init_stream(struct isp4_subdev *isp_subdev)
 		dev_err(dev, "fail to setup stream path\n");
 		return ret;
 	}
+
+	/* EXPERIMENT (patch 0047, 0048): Windows sends SET_M2M_CAL_DATA here: read the EEPROM, then send it */
+	isp4sd_exp_m2m_read(dev);
+	isp4sd_exp_m2m_send(isp_subdev);
 
 	/* EXPERIMENT (patch 0028): Windows then selects the tuning scenario (0 = preview) */
 	isp4sd_exp_win_cmd(isp_subdev, EXP_WIN_TUNING_SCENARIO, EXP_CMD_ID_APPLY_TUNING_SCENARIO,
@@ -924,7 +1493,7 @@ static void isp4sd_fw_resp_cmd_done(struct isp4_subdev *isp_subdev,
 		ele);
 
 	/* EXPERIMENT (GZ302): always show the firmware's verdict, error code and 36-byte payload */
-	dev_info(dev, "EXP-RESP: seq %u cmd 0x%08x status %u (0 ok, 1 fail, 2 skipped) fw_error_code 0x%04x payload %36ph\n",
+	exp_info(dev, "EXP-RESP: seq %u cmd 0x%08x status %u (0 ok, 1 fail, 2 skipped) fw_error_code 0x%04x payload %36ph\n",
 		 para->cmd_seq_num, para->cmd_id, para->cmd_status,
 		 para->isp4fw_error_code, para->payload);
 
@@ -999,6 +1568,8 @@ static void isp4sd_fw_resp_frame_done(struct isp4_subdev *isp_subdev,
 		dev_err(dev, "fail to get meta from mc %llx\n", mc);
 		return;
 	}
+	isp4sd_exp_af_meta_log(dev, meta);	/* patch 0049 */
+	isp4sd_exp_af_drive(dev, meta);		/* patch 0050 */
 
 	dev_dbg(dev, "ts:%llu,streamId:%d,poc:%u,preview_en:%u,status:%s(%i)\n",
 		ktime_get_ns(), stream_id, meta->poc, meta->preview.enabled,
@@ -1425,9 +1996,10 @@ int isp4sd_ioc_send_img_buf(struct v4l2_subdev *sd,
 					min_start_bufs);
 				goto error_release_buf_node;
 			}
-			dev_info(dev, "EXP: START_STREAM queued to fw (img buf), buf_sent %u, min %u\n",
+			exp_info(dev, "EXP: START_STREAM queued to fw (img buf), buf_sent %u, min %u\n",
 				 isp_subdev->sensor_info.buf_sent_cnt,
 				 min_start_bufs);
+			isp4sd_exp_after_start_stream(isp_subdev);	/* patch 0041 */
 			isp4if_dump_rings(ispif, "after START_STREAM queued (img buf)");
 			isp_subdev->sensor_info.start_stream_cmd_sent = true;
 			isp_subdev->sensor_info.output_info.start_status =
@@ -1569,10 +2141,10 @@ int isp4sd_init(struct isp4_subdev *isp_subdev, struct v4l2_device *v4l2_dev,
 	mutex_init(&isp_subdev->ops_mutex);
 	sensor_info->status = ISP4SD_START_STATUS_OFF;
 
-	/* create ISP enable gpio control */
-	isp_subdev->enable_gpio = devm_gpiod_get(isp_subdev->dev,
-						 "enable_isp",
-						 GPIOD_OUT_LOW);
+	/* create ISP enable gpio control; patch 0053: optional (no lookup without the amdgpu board patch) */
+	isp_subdev->enable_gpio = devm_gpiod_get_optional(isp_subdev->dev,
+							  "enable_isp",
+							  GPIOD_OUT_LOW);
 	if (IS_ERR(isp_subdev->enable_gpio)) {
 		ret = PTR_ERR(isp_subdev->enable_gpio);
 		dev_err(dev, "fail to get gpiod %d\n", ret);

@@ -64,6 +64,12 @@
 #                                                            # 0028): bit mask 1 RTA, 2 tuning scenario, 4 out-chan
 #                                                            # rate ratio, 8 scene mode, 0x10 fps range, 0x20 itime,
 #                                                            # 0x40 global ENABLE_PREFETCH (patch 0029)
+#     ./scripts/test-isp4-threshold.sh ... --win-cmds 0xf7 --lens-pos 4095
+#                                                            # manual focus through SET_3A_CONFIG (patch 0039,
+#                                                            # needs win_cmds bit 0x80): 300 = infinity, 4095 = macro
+#     ./scripts/test-isp4-threshold.sh ... --param vcm_init=1 --param script_vcm_mode=1
+#                                                            # pass any module parameter as name=value (repeatable;
+#                                                            # patch 0040: focus motor init and VcmMode)
 #     ./scripts/test-isp4-threshold.sh ... --win-cmds 0x77 --prefetch-flags 0
 #                                                            # ENABLE_PREFETCH payload words from bits 0..2
 #                                                            # (patch 0030; default 7 = {1,1,1})
@@ -102,6 +108,8 @@ sensor_pll=0	# patch 0036: ov13b10 applies the GZ302 registers itself; 3 = old r
 burst_ms=0
 meta_data_bufs=6
 win_cmds=0x77
+lens_args=()	# patch 0039: --lens-pos N adds lens_pos=N to insmod; empty = the module default (off)
+extra_args=()	# patch 0040: --param name=value (repeatable) adds name=value to insmod
 prefetch_flags=1
 script_i2c=2
 meta_data_resend=1
@@ -127,6 +135,10 @@ while [[ $# -gt 0 ]]; do
 	--sensor-burst-ms) burst_ms=$2; shift 2 ;;
 	--meta-data-bufs) meta_data_bufs=$2; shift 2 ;;
 	--win-cmds) win_cmds=$2; shift 2 ;;
+	--lens-pos) lens_args=("lens_pos=$2"); shift 2 ;;
+	--param)
+		[[ $2 == [a-z_]*=* ]] || { printf 'ERROR: --param expects name=value, got: %s\n' "$2" >&2; exit 1; }
+		extra_args+=("$2"); shift 2 ;;
 	--prefetch-flags) prefetch_flags=$2; shift 2 ;;
 	--script-i2c) script_i2c=$2; shift 2 ;;
 	--meta-data-resend) meta_data_resend=1; shift ;;
@@ -205,7 +217,7 @@ for run in "${runs[@]}"; do
 		# patch 0035: only debug output on; every experiment parameter keeps the module's own default
 		sudo insmod "$ko" dyndbg=+p || die "insmod failed; see: sudo dmesg | tail -30"
 	else
-	sudo insmod "$ko" min_start_bufs="$n" replay_sensor_setup="$replay" sensor_prop_variant="$v" bogus_cmd="$bogus" tuning_file="$tuning" fw_mem_pool_mb="$pool_mb" start_sensor="$start_sensor" sensor_pm_cycle="$pm_cycle" phy_init="$phy_init" skip_enable_gpio="$skip_gpio" sensor_pll="$sensor_pll" sensor_burst_ms="$burst_ms" meta_data_bufs="$meta_data_bufs" win_cmds="$win_cmds" prefetch_flags="$prefetch_flags" script_i2c="$script_i2c" meta_data_resend="$meta_data_resend" phy_diag="$phy_diag" dyndbg=+p || die "insmod failed; see: sudo dmesg | tail -30"
+	sudo insmod "$ko" min_start_bufs="$n" replay_sensor_setup="$replay" sensor_prop_variant="$v" bogus_cmd="$bogus" tuning_file="$tuning" fw_mem_pool_mb="$pool_mb" start_sensor="$start_sensor" sensor_pm_cycle="$pm_cycle" phy_init="$phy_init" skip_enable_gpio="$skip_gpio" sensor_pll="$sensor_pll" sensor_burst_ms="$burst_ms" meta_data_bufs="$meta_data_bufs" win_cmds="$win_cmds" prefetch_flags="$prefetch_flags" script_i2c="$script_i2c" meta_data_resend="$meta_data_resend" phy_diag="$phy_diag" "${lens_args[@]}" "${extra_args[@]}" dyndbg=+p || die "insmod failed; see: sudo dmesg | tail -30"
 	fi
 	sleep 2
 

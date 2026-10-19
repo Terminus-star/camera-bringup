@@ -8,6 +8,8 @@
 #include <linux/kernel_read_file.h>
 #include <linux/moduleparam.h>
 #include <linux/sizes.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/vmalloc.h>
 
 #include "isp4_debug.h"
@@ -63,12 +65,20 @@ static const struct firmware *isp4if_exp_get_fw(struct device *dev, const char *
 		release_firmware(fw);
 		return NULL;
 	}
-	dev_info(dev, "EXP-FW: loaded %s (%zu bytes)\n", name, fw->size);
+	exp_info(dev, "EXP-FW: loaded %s (%zu bytes)\n", name, fw->size);
 	return fw;
 }
 
 /* EXPERIMENT (GZ302): firmware-visible copy of the tuning file, see isp4if_replay_tuning() */
 static struct isp4if_gpu_mem_info *exp_tuning_mem;
+/* EXPERIMENT (GZ302, patch 0038): SET_3A_CONFIG payload, see isp4if_send_3a_config() */
+static struct isp4if_gpu_mem_info *exp_3a_mem;
+/* EXPERIMENT (GZ302, patch 0044): SET_LOG_MODULE_LEVEL payload, see isp4if_send_log_levels() */
+static struct isp4if_gpu_mem_info *exp_log_mem;
+/* EXPERIMENT (GZ302, patch 0045): data buffer of SEND_I2C_MSG, see isp4if_fw_i2c_write() */
+static struct isp4if_gpu_mem_info *exp_i2c_mem;
+/* EXPERIMENT (GZ302, patch 0048): SET_M2M_CAL_DATA payload, see isp4if_send_m2m_cal() */
+static struct isp4if_gpu_mem_info *exp_m2m_mem;
 
 /*
  * EXPERIMENT (GZ302): size of the firmware memory pool in MiB.  The stock driver sends 100 MiB
@@ -260,6 +270,14 @@ static void isp4if_dealloc_fw_gpumem(struct isp4_interface *ispif)
 		isp4if_gpu_mem_free(ispif, &ispif->exp_sensor_prop);
 	if (exp_tuning_mem)
 		isp4if_gpu_mem_free(ispif, &exp_tuning_mem);
+	if (exp_3a_mem)		/* patch 0038 */
+		isp4if_gpu_mem_free(ispif, &exp_3a_mem);
+	if (exp_log_mem)	/* patch 0044 */
+		isp4if_gpu_mem_free(ispif, &exp_log_mem);
+	if (exp_i2c_mem)	/* patch 0045 */
+		isp4if_gpu_mem_free(ispif, &exp_i2c_mem);
+	if (exp_m2m_mem)	/* patch 0048 */
+		isp4if_gpu_mem_free(ispif, &exp_m2m_mem);
 
 	for (unsigned int i = 0; i < ISP4IF_MAX_STREAM_BUF_COUNT; i++)
 		isp4if_gpu_mem_free(ispif, &ispif->meta_info_buf[i]);
@@ -272,7 +290,7 @@ static int isp4if_alloc_fw_gpumem(struct isp4_interface *ispif)
 	u64 pool_size = fw_mem_pool_mb ? (u64)fw_mem_pool_mb * SZ_1M :
 					 isp4if_exp_pool_size(EXP_SENSOR_PIXELS);
 
-	dev_info(dev, "EXP: firmware memory pool %llu bytes (%s)\n", pool_size,
+	exp_info(dev, "EXP: firmware memory pool %llu bytes (%s)\n", pool_size,
 		 fw_mem_pool_mb ? "fw_mem_pool_mb" : "computed like Windows");
 	ispif->fw_mem_pool = isp4if_gpu_mem_alloc(ispif, pool_size);
 	if (!ispif->fw_mem_pool)
@@ -859,7 +877,7 @@ void isp4if_dump_rings(struct isp4_interface *ispif, const char *when)
 	/* Also drain the firmware log ring: it is otherwise only read when a response arrives. */
 	isp_fw_log_dump(container_of(ispif, struct isp4_subdev, ispif), when);
 
-	dev_info(dev, "EXP-RING[%s]: INT0_EN 0x%08x INT0_STATUS 0x%08x ISP_STATUS 0x%08x\n",
+	exp_info(dev, "EXP-RING[%s]: INT0_EN 0x%08x INT0_STATUS 0x%08x ISP_STATUS 0x%08x\n",
 		 when, isp4hw_rreg(ispif->mmio, ISP_SYS_INT0_EN),
 		 isp4hw_rreg(ispif->mmio, ISP_SYS_INT0_STATUS),
 		 isp4hw_rreg(ispif->mmio, ISP_STATUS));
@@ -869,7 +887,7 @@ void isp4if_dump_rings(struct isp4_interface *ispif, const char *when)
 		u32 g1 = readl(exp_ispgpio + EXP_ISPGPIO_1);
 		u32 g2 = readl(exp_ispgpio + EXP_ISPGPIO_2);
 
-		dev_info(dev, "EXP-RING[%s]: ISP sensor-control pins gpio0 0x%08x gpio1 0x%08x gpio2 0x%08x (output bit 4: %u %u %u)\n",
+		exp_info(dev, "EXP-RING[%s]: ISP sensor-control pins gpio0 0x%08x gpio1 0x%08x gpio2 0x%08x (output bit 4: %u %u %u)\n",
 			 when, g0, g1, g2, (g0 >> EXP_ISPGPIO_OUT_BIT) & 1,
 			 (g1 >> EXP_ISPGPIO_OUT_BIT) & 1, (g2 >> EXP_ISPGPIO_OUT_BIT) & 1);
 	}
@@ -882,14 +900,14 @@ void isp4if_dump_rings(struct isp4_interface *ispif, const char *when)
 		u32 r_rd = isp4hw_rreg(ispif->mmio, r->reg_rptr);
 		u32 r_wr = isp4hw_rreg(ispif->mmio, r->reg_wptr);
 
-		dev_info(dev, "EXP-RING[%s]: %s rd %u wr %u | %s rd %u wr %u | ring size %u\n",
+		exp_info(dev, "EXP-RING[%s]: %s rd %u wr %u | %s rd %u wr %u | ring size %u\n",
 			 when, c->name, c_rd, c_wr, r->name, r_rd, r_wr, r->val_size);
 
 		if (r_rd != r_wr && r->base_sys_addr && r_rd < r->val_size &&
 		    r->val_size - r_rd >= sizeof(struct isp4fw_resp)) {
 			const struct isp4fw_resp *p = r->base_sys_addr + r_rd;
 
-			dev_info(dev, "EXP-RING[%s]:   unread on %s: seq %u resp_id 0x%x cmd_id 0x%x cmd_status %u\n",
+			exp_info(dev, "EXP-RING[%s]:   unread on %s: seq %u resp_id 0x%x cmd_id 0x%x cmd_status %u\n",
 				 when, r->name, p->resp_seq_num, p->resp_id,
 				 p->param.cmd_done.cmd_id, p->param.cmd_done.cmd_status);
 		}
@@ -940,6 +958,40 @@ static unsigned int script_i2c_restart = 1;
 module_param(script_i2c_restart, uint, 0444);
 MODULE_PARM_DESC(script_i2c_restart, "EXPERIMENT: enRestart value for script_i2c (default 1)");
 
+/*
+ * EXPERIMENT (GZ302, patch 0040): Windows' sensor plug-in (get_fw_script_ctrl_OV13B) puts its VcmMode
+ * (registry default 1) into the SET_DEVICE_SCRIPT tail at 0x1618, which we send as 0 (findings 107;
+ * INFERENCE: it is the "vcm mode" argument of the script's LensSetPos, 1 = with the slope bit).
+ * -1 (default) = leave the payload as built.
+ */
+#define EXP_SCRIPT_VCM_MODE_OFF	0x1618
+
+static int script_vcm_mode = -1;
+module_param(script_vcm_mode, int, 0444);
+MODULE_PARM_DESC(script_vcm_mode,
+		 "EXPERIMENT: VcmMode written into the SET_DEVICE_SCRIPT payload at 0x1618 (Windows: 1); -1 = leave as built");
+
+/*
+ * EXPERIMENT (GZ302, patch 0046): the whole tail that Windows' get_fw_script_ctrl_OV13B fills (findings 118).
+ * Our script body is identical to Windows'; only these five words differ. With them and script_i2c=2 the
+ * checksum must be 0x05234c5f, the value in the Windows trace. Meanings are INFERENCE.
+ */
+static bool script_tail;
+module_param(script_tail, bool, 0444);
+MODULE_PARM_DESC(script_tail,
+		 "EXPERIMENT: write the Windows SET_DEVICE_SCRIPT tail words (0x15ec=10, 0x15f0=1176, 0x1614=2, 0x1618=1, 0x1640=1); default off");
+
+static const struct {
+	u32 off;
+	u32 val;
+} exp_script_tail[] = {
+	{ 0x15ec, 10 },		/* sensor group: line time in us (mode 0) */
+	{ 0x15f0, 1176 },	/* sensor group: line length in pixels */
+	{ 0x1614, 2 },		/* sensor group, last word */
+	{ 0x1618, 1 },		/* lens group: VcmMode */
+	{ 0x1640, 1 },		/* lens group, last word */
+};
+
 static void isp4if_exp_put_i2c_desc(u8 *payload, unsigned int k, u32 addr, u32 code)
 {
 	u32 *d = (u32 *)(payload + EXP_SCRIPT_I2C_DESC_OFF + k * EXP_SCRIPT_I2C_DESC_SIZE);
@@ -962,7 +1014,7 @@ static void isp4if_exp_script_i2c(struct device *dev, u8 *payload)
 		for (k = 1; k < 4; k++)
 			isp4if_exp_put_i2c_desc(payload, k, 0x10, 0x102);
 
-	dev_info(dev, "EXP-SCRIPT-I2C: mode %u, descriptors %*ph\n", script_i2c,
+	exp_info(dev, "EXP-SCRIPT-I2C: mode %u, descriptors %*ph\n", script_i2c,
 		 4 * EXP_SCRIPT_I2C_DESC_SIZE, payload + EXP_SCRIPT_I2C_DESC_OFF);
 }
 
@@ -990,15 +1042,260 @@ static void isp4if_replay_one(struct isp4_interface *ispif, u32 cmd_id, const ch
 	    len >= EXP_SCRIPT_I2C_DESC_OFF + 4 * EXP_SCRIPT_I2C_DESC_SIZE)
 		isp4if_exp_script_i2c(dev, mem->sys_addr);
 
+	/* patch 0046: Windows' tail words; before 0040 so an explicit script_vcm_mode still wins */
+	if (cmd_id == EXP_CMD_ID_SET_DEVICE_SCRIPT && script_tail) {
+		for (unsigned int i = 0; i < ARRAY_SIZE(exp_script_tail); i++)
+			if (len >= exp_script_tail[i].off + sizeof(u32))
+				*(u32 *)(mem->sys_addr + exp_script_tail[i].off) = exp_script_tail[i].val;
+		exp_info(dev, "EXP-SCRIPT-TAIL: Windows tail written (expect checksum 0x05234c5f with script_i2c=2)\n");
+	}
+
+	/* patch 0040: VcmMode in the script tail, also before the checksum */
+	if (cmd_id == EXP_CMD_ID_SET_DEVICE_SCRIPT && script_vcm_mode >= 0 &&
+	    len >= EXP_SCRIPT_VCM_MODE_OFF + sizeof(u32)) {
+		*(u32 *)(mem->sys_addr + EXP_SCRIPT_VCM_MODE_OFF) = script_vcm_mode;
+		exp_info(dev, "EXP-SCRIPT-VCM: VcmMode %d written at payload 0x%x\n",
+			 script_vcm_mode, EXP_SCRIPT_VCM_MODE_OFF);
+	}
+
 	isp4if_split_addr64(mem->gpu_mc_addr, &pkg[0], &pkg[1]);
 	pkg[2] = len;
 	pkg[3] = isp4if_compute_check_sum(mem->sys_addr, len);
 
 	ret = isp4if_send_command_sync(ispif, cmd_id, pkg, sizeof(pkg));
-	dev_info(dev,
+	exp_info(dev,
 		 "EXP-REPLAY: %s: cmd 0x%08x, %u bytes at GPU 0x%llx, checksum 0x%08x -> %s (%d)\n",
 		 what, cmd_id, len, mem->gpu_mc_addr, pkg[3],
 		 ret ? "NO ANSWER / FAILED" : "answered", ret);
+}
+
+/*
+ * EXPERIMENT (GZ302, patch 0038): SET_3A_CONFIG, which Windows sends once per stream start (after
+ * the META buffers, before ENABLE_PREFETCH) and Linux never did, so the firmware's autofocus stayed
+ * idle (findings section 101). 92 bytes, sent indirect like the sensor setup. Windows kickoff values,
+ * read from isp_setup_3a and confirmed by the values Windows logged: flags 0x223, AE auto, flicker
+ * auto, AWB auto, AF mode 4 = CONTINUOUS_VIDEO. Only the fields whose flag bit is set are used.
+ */
+#define EXP_CMD_ID_SET_3A_CONFIG	0x02020001
+
+#define EXP_3A_F_AE_MODE	0x001
+#define EXP_3A_F_FLICKER	0x002
+#define EXP_3A_F_AWB_MODE	0x020
+#define EXP_3A_F_AF_MODE	0x200
+#define EXP_3A_F_LENS_POS	0x1000	/* patch 0039 */
+
+struct isp4if_exp_3a_config {
+	u32 flags;		/* 0x00 which fields below are valid */
+	u32 ae_mode;		/* 0x04 1 manual, 2 auto */
+	u32 flicker;		/* 0x08 1 off, 2 50 Hz, 3 60 Hz, 4 auto */
+	u32 ev_comp[2];		/* 0x0c {numerator, denominator}, flag 0x004 */
+	u32 itime;		/* 0x14 exposure time, flag 0x008 */
+	u32 iso;		/* 0x18 flag 0x010 */
+	u32 awb_mode;		/* 0x1c 1 auto, 2 manual gains, 3 light source, 4 colour temperature */
+	u32 rsvd20[4];		/* 0x20 */
+	u32 awb_param;		/* 0x30 flag 0x080 */
+	u32 common_para;	/* 0x34 flag 0x100 */
+	u32 af_mode;		/* 0x38 1 manual, 2 one shot, 3 continuous picture, 4 continuous video */
+	u32 backlight;		/* 0x3c flag 0x400 */
+	u32 rsvd40;		/* 0x40 */
+	u32 pair[4];		/* 0x44 two {valid, value} pairs, flag 0x800 (not set by Windows here) */
+	u32 lens_pos;		/* 0x54 manual focus position, flag 0x1000 */
+	u32 af_scene;		/* 0x58 0 normal, 1 macro, flag 0x2000 */
+} __packed;
+
+static unsigned int af_mode = 4;
+module_param(af_mode, uint, 0444);
+MODULE_PARM_DESC(af_mode,
+		 "EXPERIMENT: AF mode in SET_3A_CONFIG (win_cmds bit 0x80): 0 = leave AF out (flags 0x23), 1 manual, 2 one shot, 3 continuous picture, 4 continuous video (Windows, default)");
+
+/*
+ * EXPERIMENT (GZ302, patch 0039): manual focus, to test whether the firmware can move the lens at all
+ * (findings section 103). Windows' isp_fw_set_lens_pos (0x140026d74) sends SET_3A_CONFIG with flags
+ * 0x1200 (lens position + AF mode), AF mode 1 = MANUAL and the position at +0x54. The AF library's
+ * range is 0..4095, 300 = infinity, 4095 = macro. -1 (default) = off, af_mode is used as before.
+ */
+static int lens_pos = -1;
+module_param(lens_pos, int, 0444);
+MODULE_PARM_DESC(lens_pos,
+		 "EXPERIMENT: manual lens position 0..4095 sent in SET_3A_CONFIG (win_cmds bit 0x80; 300 = infinity, 4095 = macro); -1 = off");
+
+void isp4if_send_3a_config(struct isp4_interface *ispif)
+{
+	struct isp4if_exp_3a_config cfg = {
+		.flags = EXP_3A_F_AE_MODE | EXP_3A_F_FLICKER | EXP_3A_F_AWB_MODE,
+		.ae_mode = 2,
+		.flicker = 4,
+		.awb_mode = 1,
+	};
+
+	BUILD_BUG_ON(sizeof(cfg) != 0x5c);
+	if (af_mode) {
+		cfg.flags |= EXP_3A_F_AF_MODE;
+		cfg.af_mode = af_mode;
+	}
+	/* patch 0039: manual focus overrides af_mode, in the form Windows uses */
+	if (lens_pos >= 0) {
+		cfg.flags |= EXP_3A_F_AF_MODE | EXP_3A_F_LENS_POS;
+		cfg.af_mode = 1;
+		cfg.lens_pos = min(lens_pos, 4095);
+	}
+
+	/* a previous stream start left its payload buffer; the firmware has read it by now */
+	if (exp_3a_mem)
+		isp4if_gpu_mem_free(ispif, &exp_3a_mem);
+	exp_info(ispif->dev, "EXP-3A: SET_3A_CONFIG flags 0x%x, AE %u, flicker %u, AWB %u, AF %u, lens %u\n",
+		 cfg.flags, cfg.ae_mode, cfg.flicker, cfg.awb_mode, cfg.af_mode, cfg.lens_pos);
+	isp4if_replay_one(ispif, EXP_CMD_ID_SET_3A_CONFIG, "SET_3A_CONFIG", &cfg, sizeof(cfg),
+			  &exp_3a_mem);
+}
+
+/*
+ * EXPERIMENT (GZ302, patch 0048): SET_M2M_CAL_DATA (0x02090005, stream, {GPU addr lo, hi, size, checksum},
+ * sync), the module calibration Windows sends between SET_STREAM_CONFIG and APPLY_TUNING_SCENARIO
+ * (findings 121). The payload (0x2180 bytes) is built by isp4_subdev.c from the module EEPROM.
+ */
+#define EXP_CMD_ID_SET_M2M_CAL_DATA	0x02090005
+
+void isp4if_send_m2m_cal(struct isp4_interface *ispif, const void *buf, u32 len)
+{
+	/* a previous stream start left its payload buffer; the firmware has read it by now */
+	if (exp_m2m_mem)
+		isp4if_gpu_mem_free(ispif, &exp_m2m_mem);
+	isp4if_replay_one(ispif, EXP_CMD_ID_SET_M2M_CAL_DATA, "SET_M2M_CAL_DATA", buf, len, &exp_m2m_mem);
+}
+
+/*
+ * EXPERIMENT (GZ302, patch 0044): SET_LOG_MODULE_LEVEL (0x01020009, GLOBAL, indirect), to make the
+ * firmware log what happens to the lens moves (findings 111, 113). Payload (116 bytes, checked against
+ * the checksum 0x77577775 in Windows' trace): 112 bytes of 4-bit levels, the level of firmware module
+ * id M in nibble M-1 (low nibble of byte (M-1)/2 when M-1 is even, high nibble when odd), then u32 3.
+ * Windows: every module 3, the nine RTA sub-modules 0x2e..0x36 = 1 (which silences the RTA library;
+ * 0 = its output as seen on Linux so far). Module ids: 9 AF_MGR, 0x12 DEVICE_SCRIPT, 0x13 DEVICE_MGR,
+ * 0x22 AF_ALGO, 0x29 SENSOR_CTRL, 0x2b RTA, 0x34 RTA_AF. INFERENCE: 3 = info, 4 = debug; the firmware
+ * logs "out of range" for a value above its maximum.
+ */
+#define EXP_CMD_ID_SET_LOG_MODULE_LEVEL	0x01020009
+#define EXP_LOG_LEVEL_BYTES		112
+#define EXP_LOG_MAX_MODULE		(EXP_LOG_LEVEL_BYTES * 2)
+
+static char *fw_log_mod = "";
+module_param(fw_log_mod, charp, 0444);
+MODULE_PARM_DESC(fw_log_mod,
+		 "EXPERIMENT: firmware module log levels on top of Windows' 3, as id:level pairs, e.g. 0x12:4,0x29:4 (win_cmds bit 0x200)");
+
+static unsigned int fw_log_rta;	/* 0 = keep the RTA library output Linux already shows */
+module_param(fw_log_rta, uint, 0444);
+MODULE_PARM_DESC(fw_log_rta,
+		 "EXPERIMENT: level of the nine RTA sub-modules 0x2e..0x36 (Windows 1 = quiet; default 0 = as before)");
+
+static void isp4if_exp_set_nibble(u8 *lv, unsigned int id, unsigned int level)
+{
+	unsigned int n = id - 1;
+
+	if (n & 1)
+		lv[n >> 1] = (lv[n >> 1] & 0x0f) | (level << 4);
+	else
+		lv[n >> 1] = (lv[n >> 1] & 0xf0) | level;
+}
+
+void isp4if_send_log_levels(struct isp4_interface *ispif)
+{
+	struct device *dev = ispif->dev;
+	u8 buf[EXP_LOG_LEVEL_BYTES + sizeof(u32)];
+	char *copy, *cur, *tok;
+	unsigned int id, level;
+
+	memset(buf, 0x33, EXP_LOG_LEVEL_BYTES);		/* every module 3, as Windows */
+	*(u32 *)(buf + EXP_LOG_LEVEL_BYTES) = 3;	/* Windows' tail value (meaning not decoded) */
+	for (id = 0x2e; id <= 0x36; id++)
+		isp4if_exp_set_nibble(buf, id, fw_log_rta & 0xf);
+
+	/* id:level pairs; a bad pair is logged and skipped */
+	copy = kstrdup(fw_log_mod, GFP_KERNEL);
+	cur = copy;
+	while (cur && (tok = strsep(&cur, ",")) != NULL) {
+		char *lvl = strchr(tok, ':');
+
+		if (!*tok)
+			continue;
+		if (!lvl) {
+			dev_warn(dev, "EXP-LOG: ignoring \"%s\" (want id:level)\n", tok);
+			continue;
+		}
+		*lvl++ = '\0';
+		if (kstrtouint(tok, 0, &id) || kstrtouint(lvl, 0, &level) || !id ||
+		    id > EXP_LOG_MAX_MODULE || level > 0xf) {
+			dev_warn(dev, "EXP-LOG: ignoring \"%s:%s\"\n", tok, lvl);
+			continue;
+		}
+		isp4if_exp_set_nibble(buf, id, level);
+		exp_info(dev, "EXP-LOG: firmware module 0x%x log level %u\n", id, level);
+	}
+	kfree(copy);
+
+	if (exp_log_mem)
+		isp4if_gpu_mem_free(ispif, &exp_log_mem);
+	isp4if_replay_one(ispif, EXP_CMD_ID_SET_LOG_MODULE_LEVEL, "SET_LOG_MODULE_LEVEL", buf,
+			  sizeof(buf), &exp_log_mem);
+}
+
+/*
+ * EXPERIMENT (GZ302, patch 0045): an I2C write done BY THE FIRMWARE (CMD_ID_SEND_I2C_MSG 0x02090003,
+ * handler StreamCmdDevSendI2CMsg), so the host never touches the shared I2C controller while the
+ * firmware streams (host transfers then corrupt the sensor, findings 114). Layout from Windows'
+ * write sender (0x140002484, sync, 36 bytes, timeout 1 s; findings 116): controller 0, op 2 = write,
+ * restart 0, address type 1 = 7-bit, register type 1 = 8-bit, slave, register, length, first data
+ * byte, and the GPU address of a 4 KiB buffer that holds the data (Windows fills both).
+ * A 2-byte motor frame {b1, b2} is register b1 with data b2, length 1, like the script's WI2C.
+ */
+#define EXP_CMD_ID_SEND_I2C_MSG	0x02090003
+
+struct isp4if_exp_i2c_msg {
+	u32 device;		/* 0x00 ISP I2C controller index (0) */
+	u32 op;			/* 0x04 1 = read, 2 = write */
+	u32 restart;		/* 0x08 repeated start (write: 0) */
+	u32 addr_type;		/* 0x0c 1 = 7-bit address */
+	u32 reg_type;		/* 0x10 1 = 8-bit register, 2 = 16-bit */
+	u16 slave;		/* 0x14 7-bit I2C address */
+	u16 reg;		/* 0x16 register address */
+	u16 len;		/* 0x18 data bytes */
+	u8 data0;		/* 0x1a first data byte, inline */
+	u8 pad;			/* 0x1b */
+	u32 buf_lo;		/* 0x1c GPU address of the data buffer */
+	u32 buf_hi;		/* 0x20 */
+} __packed;
+
+int isp4if_fw_i2c_write(struct isp4_interface *ispif, u8 slave, u8 reg, u8 val)
+{
+	struct isp4if_exp_i2c_msg msg = {
+		.device = 0,
+		.op = 2,
+		.restart = 0,
+		.addr_type = 1,
+		.reg_type = 1,
+		.slave = slave,
+		.reg = reg,
+		.len = 1,
+		.data0 = val,
+	};
+	u32 lo, hi;
+	int ret;
+
+	BUILD_BUG_ON(sizeof(msg) != 0x24);
+	if (!exp_i2c_mem) {
+		exp_i2c_mem = isp4if_gpu_mem_alloc(ispif, SZ_4K);
+		if (!exp_i2c_mem)
+			return -ENOMEM;
+	}
+	memset(exp_i2c_mem->sys_addr, 0, exp_i2c_mem->mem_size);
+	*(u8 *)exp_i2c_mem->sys_addr = val;
+	isp4if_split_addr64(exp_i2c_mem->gpu_mc_addr, &lo, &hi);	/* no pointers into the packed struct */
+	msg.buf_lo = lo;
+	msg.buf_hi = hi;
+
+	ret = isp4if_send_command_sync(ispif, EXP_CMD_ID_SEND_I2C_MSG, &msg, sizeof(msg));
+	dev_dbg(ispif->dev, "EXP-FWI2C: write 0x%02x reg 0x%02x = 0x%02x -> %d\n", slave, reg, val, ret);
+	return ret;
 }
 
 /*
@@ -1056,7 +1353,7 @@ static void isp4if_replay_sensor_prop(struct isp4_interface *ispif)
 		break;
 	}
 
-	dev_info(ispif->dev, "EXP-REPLAY: SET_SENSOR_PROP variant %u, %u bytes\n",
+	exp_info(ispif->dev, "EXP-REPLAY: SET_SENSOR_PROP variant %u, %u bytes\n",
 		 sensor_prop_variant, len);
 	isp4if_replay_one(ispif, EXP_CMD_ID_SET_SENSOR_PROP, "SET_SENSOR_PROP", data, len,
 			  &ispif->exp_sensor_prop);
@@ -1084,7 +1381,7 @@ static void isp4if_replay_bogus_cmd(struct isp4_interface *ispif)
 		return;
 
 	ret = isp4if_send_command_sync(ispif, bogus_cmd, pkg, sizeof(pkg));
-	dev_info(ispif->dev, "EXP-REPLAY: BOGUS cmd 0x%08x (4 zero words) -> %s (%d)\n", bogus_cmd,
+	exp_info(ispif->dev, "EXP-REPLAY: BOGUS cmd 0x%08x (4 zero words) -> %s (%d)\n", bogus_cmd,
 		 ret ? "NO ANSWER / FAILED" : "answered", ret);
 }
 
@@ -1210,12 +1507,12 @@ int isp4if_phy_init(struct isp4_interface *ispif)
 		release_firmware(fw);
 		return -ENOMEM;
 	}
-	dev_info(dev, "EXP-PHY: mapped ISP offsets 0x%x-0x%x (physical 0x%llx)\n", EXP_PHY_WIN,
+	exp_info(dev, "EXP-PHY: mapped ISP offsets 0x%x-0x%x (physical 0x%llx)\n", EXP_PHY_WIN,
 		 EXP_PHY_WIN + EXP_PHY_WIN_SIZE - 1, (unsigned long long)(res->start + EXP_PHY_WIN));
 
-	dev_info(dev, "EXP-PHY: starting the D-PHY receiver (phy %u, %u Mbps, %u lanes), %u register operations\n",
+	exp_info(dev, "EXP-PHY: starting the D-PHY receiver (phy %u, %u Mbps, %u lanes), %u register operations\n",
 		 phy, rate, lanes, count);
-	dev_info(dev, "EXP-PHY: before: global reset 0x%08x, ctl 0x%08x, status 0x%08x\n",
+	exp_info(dev, "EXP-PHY: before: global reset 0x%08x, ctl 0x%08x, status 0x%08x\n",
 		 phy_rd32(w, EXP_PHY_GLOBAL_RESET), phy_rd32(w, EXP_PHY_BASE),
 		 phy_rd32(w, EXP_PHY_BASE + 0x1c));
 
@@ -1273,7 +1570,7 @@ int isp4if_phy_init(struct isp4_interface *ispif)
 	/* 6. release the lane resets (keep nothing of the 0x1f bits) */
 	phy_wr32(w, EXP_PHY_BASE + 0x14, lane_rst & 0xffffffe0);
 
-	dev_info(dev, "EXP-PHY: done: PHY ready %s (status 0x%08x), lane stop-state 0x%08x (want bits 15:8 = 0x%02x: %s), after: ctl 0x%08x\n",
+	exp_info(dev, "EXP-PHY: done: PHY ready %s (status 0x%08x), lane stop-state 0x%08x (want bits 15:8 = 0x%02x: %s), after: ctl 0x%08x\n",
 		 (ready & 1) ? "yes" : "NO", ready, stop, want, (((stop >> 8) & want) == want) ? "yes" : "NO",
 		 phy_rd32(w, EXP_PHY_BASE));
 	iounmap(w);
@@ -1307,10 +1604,10 @@ void isp4if_phy_diag(struct isp4_interface *ispif, const char *label)
 
 	isp4hw_wreg(ispif->mmio, EXP_IND_INDEX, EXP_PHY_STOPSTATE);
 	stop = isp4hw_rreg(ispif->mmio, EXP_IND_DATA);
-	dev_info(dev, "EXP-PHYDIAG[%s]: global reset 0x%08x, lane stop-state 0x%08x (bits 15:8 = 0x%02x)\n", label,
+	exp_info(dev, "EXP-PHYDIAG[%s]: global reset 0x%08x, lane stop-state 0x%08x (bits 15:8 = 0x%02x)\n", label,
 		 phy_rd32(w, EXP_PHY_GLOBAL_RESET), stop, (stop >> 8) & 0xff);
 	for (i = 0; i <= 0x30; i += 4)
-		dev_info(dev, "EXP-PHYDIAG[%s]: +0x%02x = 0x%08x\n", label, i, phy_rd32(w, EXP_PHY_BASE + i));
+		exp_info(dev, "EXP-PHYDIAG[%s]: +0x%02x = 0x%08x\n", label, i, phy_rd32(w, EXP_PHY_BASE + i));
 	iounmap(w);
 }
 
@@ -1376,7 +1673,7 @@ static void isp4if_replay_tuning(struct isp4_interface *ispif)
 	pkg[5] = size;
 
 	ret = isp4if_send_command_sync(ispif, EXP_CMD_ID_SET_TUNING_DATA, pkg, sizeof(pkg));
-	dev_info(dev, "EXP-REPLAY: SET_TUNING_DATA: %zu bytes from %s at GPU 0x%llx -> %s (%d)\n",
+	exp_info(dev, "EXP-REPLAY: SET_TUNING_DATA: %zu bytes from %s at GPU 0x%llx -> %s (%d)\n",
 		 size, tuning_file, mem->gpu_mc_addr, ret ? "NO ANSWER / FAILED" : "answered", ret);
 }
 
@@ -1387,7 +1684,7 @@ int isp4if_replay_sensor_setup(struct isp4_interface *ispif)
 	if (!replay_sensor_setup)
 		return 0;
 
-	dev_info(ispif->dev, "EXP-REPLAY: sending the Windows sensor setup before SET_STREAM_CONFIG\n");
+	exp_info(ispif->dev, "EXP-REPLAY: sending the Windows sensor setup before SET_STREAM_CONFIG\n");
 	isp4if_dump_rings(ispif, "replay: before");
 
 	/* patch 0037: the compiled device script comes from /lib/firmware */

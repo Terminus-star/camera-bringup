@@ -11,6 +11,21 @@
 
 #include "isp4_subdev.h"
 
+/*
+ * EXPERIMENT (GZ302, patch 0054): the bring-up's EXP-* trace lines (every firmware command and answer, ring
+ * states, replay details) are debug output, not info: by default they go through dev_dbg (shown with
+ * dyndbg=+p); exp_verbose=1 prints them at info level as before. Warnings and errors are not affected.
+ */
+extern bool isp4_exp_verbose;
+
+#define exp_info(dev, fmt, ...)						\
+	do {								\
+		if (isp4_exp_verbose)					\
+			dev_info(dev, fmt, ##__VA_ARGS__);		\
+		else							\
+			dev_dbg(dev, fmt, ##__VA_ARGS__);		\
+	} while (0)
+
 #ifdef CONFIG_DEBUG_FS
 struct isp4_device;
 

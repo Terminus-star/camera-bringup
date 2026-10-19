@@ -6,6 +6,7 @@
 #ifndef _ISP4_VIDEO_H_
 #define _ISP4_VIDEO_H_
 
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-dev.h>
 #include <media/videobuf2-memops.h>
 
@@ -45,6 +46,9 @@ struct isp4vid_dev {
 	struct device *dev;
 	struct v4l2_subdev *isp_sdev;
 	struct v4l2_fract timeperframe;
+
+	/* EXPERIMENT (GZ302, patch 0043): focus_absolute control */
+	struct v4l2_ctrl_handler ctrl_handler;
 };
 
 int isp4vid_dev_init(struct isp4vid_dev *isp_vdev, struct v4l2_subdev *isp_sd);

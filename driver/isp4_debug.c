@@ -3,6 +3,8 @@
  * Copyright (C) 2025 Advanced Micro Devices, Inc.
  */
 
+#include <linux/moduleparam.h>
+
 #include "isp4.h"
 #include "isp4_debug.h"
 #include "isp4_hw_reg.h"
@@ -11,6 +13,12 @@
 #define ISP4DBG_FW_LOG_RINGBUF_SIZE (2 * 1024 * 1024)
 #define ISP4DBG_MACRO_2_STR(X) #X
 #define ISP4DBG_ONE_TIME_LOG_LEN 510
+
+/* EXPERIMENT (GZ302, patch 0054): see exp_info() in isp4_debug.h */
+bool isp4_exp_verbose;
+module_param_named(exp_verbose, isp4_exp_verbose, bool, 0644);
+MODULE_PARM_DESC(exp_verbose,
+		 "EXPERIMENT: print the bring-up trace (EXP-* lines) at info level instead of debug (default off; dyndbg=+p also shows them)");
 
 #ifdef CONFIG_DEBUG_FS
 
@@ -107,7 +115,7 @@ void isp_fw_log_print(struct isp4_subdev *isp)
 					*le = 0;
 
 				if (*str != '\0')
-					dev_info(isp->dev, "EXP-FWLOG: %s", str);
+					exp_info(isp->dev, "EXP-FWLOG: %s", str);
 
 				if (le) {
 					*le = 0x0A;
@@ -120,7 +128,7 @@ void isp_fw_log_print(struct isp4_subdev *isp)
 
 				temp_ch = str[tmp_len];
 				str[tmp_len] = 0;
-				dev_info(isp->dev, "EXP-FWLOG: %s", str);
+				exp_info(isp->dev, "EXP-FWLOG: %s", str);
 				str[tmp_len] = temp_ch;
 				str = &str[tmp_len];
 			}
@@ -141,7 +149,7 @@ void isp_fw_log_dump(struct isp4_subdev *isp, const char *when)
 	u32 rd = isp4hw_rreg(isp->mmio, ISP_LOG_RB_RPTR0);
 	u32 wr = isp4hw_rreg(isp->mmio, ISP_LOG_RB_WPTR0);
 
-	dev_info(isp->dev, "EXP-FWLOG[%s]: log ring rd %u wr %u, enable_fw_log %d\n",
+	exp_info(isp->dev, "EXP-FWLOG[%s]: log ring rd %u wr %u, enable_fw_log %d\n",
 		 when, rd, wr, isp->enable_fw_log);
 	isp_fw_log_print(isp);
 }
