@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generate the DKMS package aur/gz302-camera-dkms/: the three GZ302 camera modules (amd_isp4_capture,
-# ov13b10, amd_isp4) as source, built by DKMS for every installed stock linux-cachyos kernel, plus the ACPI _CID
+# ov13b10, amd_isp4) as source, built by DKMS for every installed kernel from 6.18 on, plus the ACPI _CID
 # table (acpi/gz302-camb-cid.asl) and its mkinitcpio drop-in, which let the stock kernel's amdgpu find the camera
 # (findings 136-138). Tuning changes ship as a new version of this small package; no kernel is built.
 #
@@ -23,7 +23,7 @@ set -euo pipefail
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 tarball=${1:?usage: $0 TARBALL}
 patch_dir="$project_dir/dkms/patches"	# the DKMS package's patches against the CachyOS sources
-dkms_ver=0.3.1
+dkms_ver=0.4.0
 out="$project_dir/aur/gz302-camera-dkms"
 patches=(
 	0002-platform-amd-isp4-add-gz302-ov13b10-graph.patch
@@ -76,9 +76,10 @@ BUILT_MODULE_NAME[1]="ov13b10"
 DEST_MODULE_LOCATION[1]="/updates/dkms"
 BUILT_MODULE_NAME[2]="amd_isp4"
 DEST_MODULE_LOCATION[2]="/updates/dkms"
-# The stock linux-cachyos kernel (the ACPI _CID table installed by this package lets its amdgpu find the camera).
-# Other kernels (lts, rc, deckify) are skipped: the sources may not build there.
-BUILD_EXCLUSIVE_KERNEL=".*-cachyos$"
+# Any kernel from 6.18 on (the oldest the sources were build-tested on, findings 143). Officially tested: CachyOS
+# 7.2+ (linux-cachyos). Other kernels (CachyOS lts/rc/deckify, Arch linux/lts/zen, ...) build but are up to their
+# users to test.
+BUILD_EXCLUSIVE_KERNEL_MIN="6.18"
 AUTOINSTALL="yes"
 EOF
 
@@ -110,9 +111,10 @@ mapfile -t files < <(cd "$pkg" && ls -I '*.install')	# sources, Kbuild, dkms.con
 	cat <<EOF
 # Maintainer: $maintainer
 #
-# Rear camera drivers for the ASUS ROG Flow Z13 2025 (GZ302EA), built by DKMS for each installed stock
-# linux-cachyos kernel: amd_isp4_capture (ISP4 capture), ov13b10 (sensor, GZ302 quirk) and amd_isp4 (camera
-# graph). They replace the kernel's own copies (DKMS installs into updates/dkms/, which is searched first).
+# Rear camera drivers for the ASUS ROG Flow Z13 2025 (GZ302EA), built by DKMS for each installed kernel from
+# 6.18 on (officially tested: linux-cachyos 7.2+; other kernels are up to their users to test):
+# amd_isp4_capture (ISP4 capture), ov13b10 (sensor, GZ302 quirk) and amd_isp4 (camera graph). They replace the
+# kernel's own copies (DKMS installs into updates/dkms/, which is searched first).
 # Sources: CachyOS $top with the camera-bringup patches ${patches[*]%%-*}.
 # Also installs an ACPI table that adds _CID "OMNI5C10" to the camera (\_SB.CAMB), so the stock kernel's amdgpu
 # finds it, and a mkinitcpio drop-in enabling the acpi_override hook. The mkinitcpio pacman hook rebuilds every
@@ -123,13 +125,15 @@ mapfile -t files < <(cd "$pkg" && ls -I '*.install')	# sources, Kbuild, dkms.con
 pkgname=gz302-camera-dkms
 pkgver=$dkms_ver
 pkgrel=1
-pkgdesc="Rear camera drivers (DKMS) and ACPI camera table for the ASUS ROG Flow Z13 GZ302, for linux-cachyos"
+pkgdesc="Rear camera drivers (DKMS) and ACPI camera table for the ASUS ROG Flow Z13 GZ302"
 arch=('any')
 url="https://github.com/Terminus-star/camera-bringup"
 license=('GPL-2.0-only')
-# linux-cachyos-headers: DKMS builds the modules against them (its pacman hook also builds for newer kernels when
-# their headers arrive).
-depends=('dkms' 'gz302-camera-firmware' 'linux-cachyos-headers')
+# No headers package in depends (the usual rule for DKMS packages): DKMS builds for every kernel whose headers are
+# installed (its pacman hook also builds for newer kernels when their headers arrive), so install the headers
+# package of each kernel you boot.
+depends=('dkms' 'gz302-camera-firmware')
+optdepends=('linux-cachyos-headers: build the modules for linux-cachyos (the officially tested kernel)')
 backup=('etc/mkinitcpio.conf.d/90-gz302-camera-acpi.conf')
 install=gz302-camera-dkms.install
 source=(

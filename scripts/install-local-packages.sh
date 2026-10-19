@@ -85,7 +85,14 @@ if (( fw_needed )); then
 fi
 # DKMS builds against /usr/lib/modules/<kernel>/build, which the -headers package provides.
 if (( dk_needed )) && [[ ! -f /usr/lib/modules/$(uname -r)/build/.config ]]; then
-	echo "MISSING: headers for the running kernel $(uname -r); install them, e.g.  sudo pacman -S linux-cachyos-headers" >&2
+	# The headers package is named after the kernel package that owns the running kernel's vmlinuz
+	# (linux-cachyos -> linux-cachyos-headers, linux-zen -> linux-zen-headers, ...).
+	kpkg=$(pacman -Qqo "/usr/lib/modules/$(uname -r)/vmlinuz" 2>/dev/null || true)
+	if [[ -n $kpkg ]]; then
+		echo "MISSING: headers for the running kernel $(uname -r); install them:  sudo pacman -S $kpkg-headers" >&2
+	else
+		echo "MISSING: headers for the running kernel $(uname -r); install its -headers package" >&2
+	fi
 	problems=1
 fi
 (( problems == 0 )) || die "fix the problems above, then run this again (nothing was built or installed)"

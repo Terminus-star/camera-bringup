@@ -2,9 +2,10 @@
 
 The rear camera of the 2025 Flow Z13 (AMD Ryzen AI Max "Strix Halo") does not work on stock Linux: the
 OmniVision **OV13B10** sensor sits behind AMD's image signal processor (**ISP 4.1**), and the kernel's ISP
-drivers only know AMD's reference board. This repository makes it work on the **stock CachyOS kernel**: a DKMS
-package with the camera drivers and a small ACPI table, a firmware package that you build from your own Windows
-install, and the notes and tools from the bring-up. No kernel has to be compiled.
+drivers only know AMD's reference board. This repository makes it work on a **stock Arch or CachyOS kernel**
+(officially tested: `linux-cachyos` 7.2+): a DKMS package with the camera drivers and a small ACPI table, a
+firmware package that you build from your own Windows install, and the notes and tools from the bring-up. No
+kernel has to be compiled.
 
 > **Status: working, still being tuned.** `/dev/video0` gives live **1920x1080 NV12 at 30 fps**
 > (YUYV and 1920x1440 also offered) with auto exposure and neutral colours; tested with ffplay and OBS.
@@ -18,9 +19,22 @@ install, and the notes and tools from the bring-up. No kernel has to be compiled
 
 **Before you start:**
 
-- The stock **`linux-cachyos`** kernel with **`linux-cachyos-headers`** (DKMS builds the drivers against them;
-  the package pulls the headers in if they are missing). Other kernels (LTS, rc, deckify) are not supported.
-- **mkinitcpio** for the initramfs (the CachyOS default); the package adds an ACPI table to it.
+- A kernel from **6.18** on with its **headers package** installed (DKMS builds the drivers against it; since
+  `gz302-camera-dkms` 0.4.0 no headers package is forced on you). DKMS builds for every installed kernel that has
+  its headers:
+
+  | kernel | headers package | status |
+  |---|---|---|
+  | `linux-cachyos` 7.2+ | `linux-cachyos-headers` | **officially tested** |
+  | `linux-cachyos-lts`, `-rc`, `-deckify` | `linux-cachyos-lts-headers`, ... | builds; up to you to test |
+  | Arch `linux`, `linux-lts`, `linux-zen` | `linux-headers`, `linux-lts-headers`, `linux-zen-headers` | builds; up to you to test |
+
+  "Builds" means the drivers compile cleanly against that kernel's headers (findings 143); whether the camera
+  works there has not been checked. Reports are welcome (see below).
+- **mkinitcpio** for the initramfs (the Arch and CachyOS default); the package adds an ACPI table to it.
+- **Secure Boot off** (`cat /sys/kernel/security/lockdown` shows `[none]`): a locked-down kernel ignores ACPI
+  tables from the initramfs ("kernel is locked down, ignoring table override"), and amdgpu then never starts the
+  camera.
 - Your **Windows partition, mounted** (read-only is enough; unlock it first if it uses BitLocker), e.g. at
   `/mnt/windows`. Three camera files are taken from it (see below); nothing from Windows is distributed here.
 - Tested on **CachyOS with the Limine bootloader**.
@@ -73,11 +87,24 @@ install, and the notes and tools from the bring-up. No kernel has to be compiled
    status, the camera's kernel log lines and a 3-second image check; no hostname, serials or Windows files) to
    `scratch/reports/`. Attach it to an issue. Reports from more GZ302 owners are what upstream support needs.
 
-**Updating:** `git pull` in the clone and run the script again. A new CachyOS kernel needs nothing from you:
-DKMS builds the drivers for it when its headers are installed. If that build fails (a kernel whose ISP
+**Updating:** `git pull` in the clone and run the script again. A new kernel needs nothing from you: DKMS
+builds the drivers for it when its headers are installed. If that build fails (a kernel whose ISP
 driver changed), please open an issue with the DKMS build log (`/var/lib/dkms/gz302-camera/*/build/make.log`).
 
 Details and troubleshooting: [`aur/README.md`](aur/README.md).
+
+## Fedora / Ubuntu (TODO)
+
+Not supported yet: the installer needs pacman and makepkg. Planned: an installer without pacman that builds the
+firmware with the same tools, registers the drivers with `dkms add/build/install`, and adds the ACPI table
+through dracut (Fedora, `acpi_override="yes"`) or an early initrd (Ubuntu, initramfs-tools has no ACPI table
+option). Points already known:
+
+- Secure Boot (on by default there) must be off, as above.
+- Ubuntu 26.04's dkms (3.2.2) predates `BUILD_EXCLUSIVE_KERNEL_MIN` (dkms 3.3.0), so the installer has to check
+  the kernel version itself.
+- `tools/build_winfw.py` reads the stock ISP firmware raw or as `.zst`; other compressions (`.xz`) still need
+  adding.
 
 ## What it takes
 
@@ -87,7 +114,7 @@ The camera needs changes in three drivers, one ACPI table, and a set of firmware
 amdgpu (ISP power, firmware)         unchanged: the ACPI table makes it find the GZ302's camera
   └─ amd_isp4 (board description)    0002 describe the OV13B10 and its CSI-2 link, 0008 sensor reset GPIO
        ├─ ov13b10 (sensor driver)    0004 I2C id, 0006 GZ302 PLL and mode registers
-       └─ amd_isp4_capture (V4L2)    0007 everything the ISP firmware needs to stream (from 0009-0053)
+       └─ amd_isp4_capture (V4L2)    0007 everything the ISP firmware needs to stream (from 0009-0055)
 ```
 
 | change | where | why |
@@ -123,7 +150,7 @@ files you copy, with [`tools/build_winfw.py`](tools/build_winfw.py) and
 | [`aur/`](aur/) | the two packages (`gz302-camera-dkms`, `gz302-camera-firmware`) and their instructions |
 | [`dkms/patches/`](dkms/patches/) | the patches the DKMS package is built from (0002, 0004, 0006, 0007, 0008) |
 | [`acpi/`](acpi/) | the ACPI table source and its mkinitcpio drop-in (shipped by the DKMS package) |
-| [`driver/`](driver/) | the capture driver as an out-of-tree module, with its development history as patches 0009-0053 ([`driver/README.md`](driver/README.md)) |
+| [`driver/`](driver/) | the capture driver as an out-of-tree module, with its development history as patches 0009-0055 ([`driver/README.md`](driver/README.md)) |
 | [`data/`](data/) | the two data files shipped with the firmware package |
 | [`tools/`](tools/) | firmware/script builders, D-PHY and disassembly helpers, Windows trace decoders, image metrics |
 | [`scripts/`](scripts/) | build, test and release scripts (each one starts with a comment saying what it does) |

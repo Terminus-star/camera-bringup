@@ -21,8 +21,8 @@ results.
 ## Files
 
 In the packages: patches 0009-0055 are in `dkms/patches/0007-media-amd-isp4-gz302-capture.patch`, which
-ships in the DKMS package `gz302-camera-dkms` 0.3.1 for the stock linux-cachyos kernel. New patches are
-stacked onto it with `scripts/update-capture-patch.sh TARBALL FIRST LAST`, then `scripts/make-aur-dkms.sh
+ships in the DKMS package `gz302-camera-dkms` 0.4.0 (any kernel from 6.18; officially tested on linux-cachyos
+7.2+). New patches are stacked onto it with `scripts/update-capture-patch.sh TARBALL FIRST LAST`, then `scripts/make-aur-dkms.sh
 TARBALL` (raise `dkms_ver`) and `scripts/install-local-packages.sh`: no kernel compile.
 
 | Path | What it is |

@@ -1,21 +1,24 @@
 # GZ302 rear camera packages (AUR)
 
 Two Arch/CachyOS packages that make the rear camera (OmniVision OV13B10 behind the AMD ISP 4.1) of the
-**ASUS ROG Flow Z13 2025 (GZ302EA)** work on the stock `linux-cachyos` kernel:
+**ASUS ROG Flow Z13 2025 (GZ302EA)** work on a stock kernel (officially tested: `linux-cachyos` 7.2+):
 
 | package | what it is |
 |---|---|
 | `gz302-camera-firmware` | firmware and data files for the camera, built on your machine from three files you copy from your own Windows install |
-| `gz302-camera-dkms` | the camera drivers (`amd_isp4_capture`, `ov13b10`, `amd_isp4`) with [`dkms/patches/`](../dkms/patches/) 0002, 0004, 0006, 0007, 0008, as source; DKMS builds them for each installed `linux-cachyos` kernel and they replace the kernel's own copies. Also installs a small ACPI table ([`acpi/`](../acpi/), adds the compatible ID `OMNI5C10` to the camera) and a mkinitcpio drop-in, so the stock kernel's amdgpu finds the camera; every initramfs is rebuilt on install and removal (findings 136-138) |
+| `gz302-camera-dkms` | the camera drivers (`amd_isp4_capture`, `ov13b10`, `amd_isp4`) with [`dkms/patches/`](../dkms/patches/) 0002, 0004, 0006, 0007, 0008, as source; DKMS builds them for each installed kernel from 6.18 on that has its headers, and they replace the kernel's own copies. Also installs a small ACPI table ([`acpi/`](../acpi/), adds the compatible ID `OMNI5C10` to the camera) and a mkinitcpio drop-in, so the stock kernel's amdgpu finds the camera; every initramfs is rebuilt on install and removal (findings 136-138) |
 
-`gz302-camera-dkms` depends on `gz302-camera-firmware` and `linux-cachyos-headers`. Driver updates are new
+`gz302-camera-dkms` depends on `gz302-camera-firmware` (and `dkms`); install the headers package of each kernel
+you boot (`linux-cachyos-headers` for the tested kernel, an optional dependency). Driver updates are new
 versions of `gz302-camera-dkms`. The camera is still being tuned: autofocus is experimental and off (manual focus
 works, `focus_absolute`), and colours are not yet matched to Windows. The driver's detailed trace (`EXP-...` lines)
 is debug output since 0.3.0; module parameter `exp_verbose=1` (or `dyndbg=+p`) shows it.
 
 ## Before you start
 
-- The stock `linux-cachyos` kernel (other kernels such as LTS, rc or deckify are skipped by DKMS).
+- A kernel from 6.18 on and its headers package (e.g. `linux-cachyos-headers`). Officially tested: `linux-cachyos`
+  7.2+. Other kernels (CachyOS `-lts`, `-rc`, `-deckify`; Arch's `linux`, `linux-lts`, `linux-zen`, ...) build
+  (findings 143) but are up to their users to test; DKMS skips kernels older than 6.18.
 - mkinitcpio for the initramfs (the CachyOS default). Tested on CachyOS with Limine.
 
 ## 1. Copy three files from Windows
@@ -79,9 +82,9 @@ If the modalias has no `:OMNI5C10:`, the initramfs was not rebuilt with the tabl
 - The ISP firmware image is installed to `/usr/lib/firmware/updates/amdgpu/isp_4_1_1.bin`, which the
   kernel and mkinitcpio prefer over the linux-firmware image, so other kernels load it too
   (without the camera drivers nothing else changes for them).
-- The ACPI table is in every kernel's initramfs. On kernels DKMS skips (LTS, rc, deckify), amdgpu then also
-  starts the ISP, and the kernel's own unpatched drivers find no camera they know; untested beyond that.
-- New CachyOS kernels need nothing: DKMS builds the drivers when their headers are installed. If the build fails
+- The ACPI table is in every kernel's initramfs. On kernels DKMS skips (older than 6.18, or without headers),
+  amdgpu then also starts the ISP, and the kernel's own unpatched drivers find no camera they know; untested beyond that.
+- New kernels need nothing: DKMS builds the drivers when their headers are installed. If the build fails
   (a kernel whose ISP4 driver changed), see "New kernel breaks the DKMS build" below.
 
 ## Maintainers: version bump and release
