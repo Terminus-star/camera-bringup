@@ -6,8 +6,8 @@
 #
 # Contains: kernel and package versions, board name and BIOS version, DKMS status, the camera's ACPI IDs, which
 # module files are loaded, the video nodes, sha256 of the installed camera firmware files, and the camera lines of
-# this boot's kernel log. Leaves out: hostname, timestamps, serial numbers, the Windows files themselves, firmware
-# or calibration contents. Read it before you share it.
+# this boot's kernel log. Leaves out: hostname, timestamps, serial numbers, your home folder and the clone's path
+# (shown as ~ and <repo>), the Windows files themselves, firmware or calibration contents. Read it before you share it.
 # Output: scratch/reports/gz302-camera-report-STAMP.txt (scratch/ is not tracked by git).
 set -euo pipefail
 
@@ -64,7 +64,10 @@ section() { printf '\n== %s ==\n' "$1"; }
 
 	if (( check )); then
 		section "camera check"
-		bash "$project_dir/scripts/camera-check.sh" 2>&1 || echo "camera-check failed (see above)"
+		# camera-check prints full paths of its result files; hide the clone's location and the home folder (user name)
+		bash "$project_dir/scripts/camera-check.sh" 2>&1 \
+			| sed -e "s|$project_dir|<repo>|g" -e "s|$HOME|~|g" \
+			|| echo "camera-check failed (see above)"
 	fi
 
 	section "kernel log, camera lines of this boot (firmware log lines left out)"
