@@ -8,18 +8,9 @@
 #               () for GCC. Read from the kernel's own .config, because a module must be built with
 #               the same compiler family as its kernel.
 
-# Default: the RUNNING kernel, because insmod only loads a module built for the running kernel. A newer
-# installed kernel is only usable after a reboot, so it is mentioned below instead of chosen silently.
-if [[ -z ${KVER:-} ]]; then
-	KVER=$(uname -r)
-	cam_ver=$(pacman -Q linux-cachyos-camera 2>/dev/null | cut -d' ' -f2 || true)	# e.g. 7.2.11-1
-	if [[ -n $cam_ver && $KVER != "$cam_ver-cachyos-camera" ]]; then
-		echo "NOTE: running $KVER, but linux-cachyos-camera $cam_ver is installed: reboot into it to test," >&2
-		echo "      or build for it now with  KVER=$cam_ver-cachyos-camera  before the command." >&2
-	elif [[ -z $cam_ver ]]; then
-		echo "NOTE: linux-cachyos-camera is not installed; the camera only works on a kernel with the camera patches." >&2
-	fi
-fi
+# Default: the RUNNING kernel, because insmod only loads a module built for the running kernel. The camera works
+# on the stock linux-cachyos kernel with gz302-camera-dkms installed (ACPI camera table; findings 136-138).
+KVER=${KVER:-$(uname -r)}
 KDIR=${KDIR:-/usr/lib/modules/$KVER/build}
 
 if [[ ! -f $KDIR/.config ]]; then

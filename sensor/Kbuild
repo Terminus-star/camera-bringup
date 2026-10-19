@@ -1,2 +1,0 @@
-# ov13b10 sensor driver: upstream 7.2.0 + I2C device id (camera kernel patch 0004) + GZ302 quirk
-obj-m += ov13b10.o

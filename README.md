@@ -2,52 +2,31 @@
 
 The rear camera of the 2025 Flow Z13 (AMD Ryzen AI Max "Strix Halo") does not work on stock Linux: the
 OmniVision **OV13B10** sensor sits behind AMD's image signal processor (**ISP 4.1**), and the kernel's ISP
-drivers only know AMD's reference board. This repository makes it work: kernel patches, an AUR kernel
-package, a firmware package that you build from your own Windows install, and the notes and tools from
-the bring-up.
+drivers only know AMD's reference board. This repository makes it work on the **stock CachyOS kernel**: a DKMS
+package with the camera drivers and a small ACPI table, a firmware package that you build from your own Windows
+install, and the notes and tools from the bring-up. No kernel has to be compiled.
 
 > **Status: working, still being tuned.** `/dev/video0` gives live **1920x1080 NV12 at 30 fps**
 > (YUYV and 1920x1440 also offered) with auto exposure and neutral colours; tested with ffplay and OBS.
-> Not done yet: autofocus (the lens stays at its rest position, sharp at room distance), white balance
-> and image tuning matched to Windows. The driver still writes a lot of debug output (`EXP-...` lines)
-> to the kernel log. The front and IR cameras are separate USB cameras and already work on stock Linux.
+> **Manual focus** works as the standard control `focus_absolute` (e.g. the focus slider in OBS).
+> The module's factory calibration (lens shading, white balance, AF data) is loaded like on Windows.
+> Not done yet: autofocus (an experimental driver-side autofocus exists, off by default), white balance
+> and image tuning matched to Windows. The front and IR cameras are separate USB cameras and already work on
+> stock Linux.
 
 ## Install (Arch / CachyOS)
 
 **Before you start:**
 
-- **CachyOS's signing keys** in your gpg keyring (makepkg checks the kernel tarball's signature with
-  them and otherwise stops with "unknown public key"):
+- The stock **`linux-cachyos`** kernel with **`linux-cachyos-headers`** (DKMS builds the drivers against them;
+  the package pulls the headers in if they are missing). Other kernels (LTS, rc, deckify) are not supported.
+- **mkinitcpio** for the initramfs (the CachyOS default); the package adds an ACPI table to it.
+- Your **Windows partition, mounted** (read-only is enough; unlock it first if it uses BitLocker), e.g. at
+  `/mnt/windows`. Three camera files are taken from it (see below); nothing from Windows is distributed here.
+- Tested on **CachyOS with the Limine bootloader**.
 
-  ```sh
-  gpg --recv-keys E8B9AA39F054E30E8290D492C3C4820857F654FE E18447AC260021D31F3FF6C4C8A2A4774B8B63C4
-  ```
-
-- **About 35 GB free** on the disk holding the clone while the kernel builds (the build tree is
-  deleted again afterwards), and **20-30 minutes** for the build on the GZ302.
-- Your **Windows install** (or a copy of its driver folder) for the three files in step 1.
-- Tested on **CachyOS with the Limine bootloader**. Plain Arch should work but is untested; with GRUB
-  or systemd-boot you may have to update the boot menu the way you normally do after a kernel install.
-
-1. Copy three files from your **own Windows install** into `~/cam-firm-gz302ea/` (any upper/lower case):
-
-   | file | Windows folder |
-   |---|---|
-   | `OV13B_3001_ROG_SRX.atb` | `C:\Windows\System32\DriverStore\FileRepository\sensorov13b.inf_amd64_*\` |
-   | `asm_OV13B.asm` | `C:\Windows\System32\DriverStore\FileRepository\sensorov13b.inf_amd64_*\` |
-   | `srx_h_isp_firmware_signed.ram` | `C:\Windows\System32\DriverStore\FileRepository\amdcamera.inf_amd64_*\` |
-
-   With the Windows partition mounted (read-only is enough), e.g. at `/mnt/windows`:
-
-   ```sh
-   mkdir ~/cam-firm-gz302ea
-   cp /mnt/windows/Windows/System32/DriverStore/FileRepository/sensorov13b.inf_amd64_*/OV13B_3001_ROG_SRX.atb ~/cam-firm-gz302ea/
-   cp /mnt/windows/Windows/System32/DriverStore/FileRepository/sensorov13b.inf_amd64_*/asm_OV13B.asm ~/cam-firm-gz302ea/
-   cp /mnt/windows/Windows/System32/DriverStore/FileRepository/amdcamera.inf_amd64_*/srx_h_isp_firmware_signed.ram ~/cam-firm-gz302ea/
-   ```
-
-2. Build and install the two packages from a clone of this repository (the packages are not on the
-   AUR yet, because the AUR is not accepting new accounts at the moment):
+1. Clone this repository and run the installer (the packages are not on the AUR yet, because the AUR is not
+   accepting new accounts at the moment):
 
    ```sh
    git clone https://github.com/Terminus-star/camera-bringup.git
@@ -55,56 +34,73 @@ the bring-up.
    bash scripts/install-local-packages.sh
    ```
 
-   The script first checks the folder above and that no camera files copied by hand are in the way
-   (it lists every problem with the command to fix it), then builds and installs
-   `gz302-camera-firmware`, then builds and installs `linux-cachyos-camera` and its headers. It asks
-   for sudo before installing anything and stops at the first problem. Running it again is safe: it
-   skips packages already installed at that version, and if the kernel was compiled but not installed
-   (for example the sudo prompt timed out) it installs the built packages without compiling again
-   (`--rebuild` forces a new compile, `--dry-run` only shows what it would do). The packages are
-   normal pacman packages, so `pacman -Q linux-cachyos-camera` shows them and `pacman -R` removes them.
+   The script copies the three Windows files into `~/cam-firm-gz302ea/` from the mounted Windows partition
+   ([`scripts/copy-windows-files.sh`](scripts/copy-windows-files.sh); it mounts nothing and keeps files already
+   there), checks the kernel headers and that no camera files copied by hand are in the way (it lists every
+   problem with the command to fix it), then builds and installs
+   `gz302-camera-firmware` and `gz302-camera-dkms`. It asks for sudo before installing anything and stops at the
+   first problem. Running it again is safe: it skips packages already installed at that version
+   (`--rebuild` builds them again, `--dry-run` only shows what it would do). Installing the packages rebuilds the
+   initramfs of your kernels automatically. They are normal pacman packages: `pacman -Q gz302-camera-dkms` shows
+   them, `pacman -R gz302-camera-dkms gz302-camera-firmware` removes everything again (drivers, ACPI table,
+   firmware files) and rebuilds the initramfs without them.
 
-   The same by hand, firmware first (the kernel package depends on it):
+   Without a mounted Windows partition, copy the files into `~/cam-firm-gz302ea/` (any upper/lower case) yourself,
+   e.g. from a USB stick filled while Windows runs:
+
+   | file | Windows folder |
+   |---|---|
+   | `OV13B_3001_ROG_SRX.atb` | `C:\Windows\System32\DriverStore\FileRepository\sensorov13b.inf_amd64_*\` |
+   | `asm_OV13B.asm` | `C:\Windows\System32\DriverStore\FileRepository\sensorov13b.inf_amd64_*\` |
+   | `srx_h_isp_firmware_signed.ram` | `C:\Windows\System32\DriverStore\FileRepository\amdcamera.inf_amd64_*\` |
+
+   The same install by hand, in this order (the DKMS package depends on the firmware package):
 
    ```sh
    cd aur/gz302-camera-firmware && makepkg -si
-   cd ../linux-cachyos-camera && makepkg -si
+   cd ../gz302-camera-dkms && makepkg -si
    ```
 
-   Once the packages are on the AUR, `paru -S linux-cachyos-camera` will do both steps.
+2. Reboot and check:
 
-3. Reboot into **linux-cachyos-camera** and check: `uname -r` ends in `-cachyos-camera`, then
-   `ffplay -f v4l2 -video_size 1920x1080 -input_format nv12 /dev/video0`.
+   ```sh
+   cat /sys/bus/acpi/devices/OMNI13B1:00/modalias        # ends in :OMNI5C10:
+   modinfo -n amd_isp4_capture ov13b10 amd_isp4          # paths under updates/dkms/
+   ffplay -f v4l2 -video_size 1920x1080 -input_format nv12 /dev/video0
+   ```
 
-Updating: when CachyOS releases a new kernel, `git pull` in the clone and run the script again (the
-kernel package is updated in this repository for each release).
+3. Please report back, working or not: `bash scripts/report.sh --check` writes a short report (versions, DKMS
+   status, the camera's kernel log lines and a 3-second image check; no hostname, serials or Windows files) to
+   `scratch/reports/`. Attach it to an issue. Reports from more GZ302 owners are what upstream support needs.
+
+**Updating:** `git pull` in the clone and run the script again. A new CachyOS kernel needs nothing from you:
+DKMS builds the drivers for it when its headers are installed. If that build fails (a kernel whose ISP
+driver changed), please open an issue with the DKMS build log (`/var/lib/dkms/gz302-camera/*/build/make.log`).
 
 Details and troubleshooting: [`aur/README.md`](aur/README.md).
 
-Not on Arch? The patches in [`kernel/patches/`](kernel/patches/) apply to mainline Linux (tested against
-7.2.9 and 7.3-rc6); you still need the firmware files the AUR package builds
-([`tools/`](tools/), see below).
-
 ## What it takes
 
-The camera needs changes in four kernel drivers plus a set of firmware and data files.
+The camera needs changes in three drivers, one ACPI table, and a set of firmware and data files.
 
 ```
-amdgpu (ISP power, firmware)         0001 recognise the GZ302's ACPI camera  0003/0005 GPIO lookups
-  └─ amd_isp4 (board description)    0002 describe the OV13B10 and its CSI-2 link
+amdgpu (ISP power, firmware)         unchanged: the ACPI table makes it find the GZ302's camera
+  └─ amd_isp4 (board description)    0002 describe the OV13B10 and its CSI-2 link, 0008 sensor reset GPIO
        ├─ ov13b10 (sensor driver)    0004 I2C id, 0006 GZ302 PLL and mode registers
-       └─ amd_isp4_capture (V4L2)    0007 everything the ISP firmware needs to stream (from 0009-0037)
+       └─ amd_isp4_capture (V4L2)    0007 everything the ISP firmware needs to stream (from 0009-0053)
 ```
 
-| patch | driver | why |
+| change | where | why |
 |---|---|---|
-| 0001 | amdgpu | amdgpu only starts the ISP for AMD's reference sensor (`OMNI5C10`); the GZ302 reports `OMNI13B1` |
+| ACPI table ([`acpi/`](acpi/)) | initramfs | amdgpu only starts the ISP for AMD's reference sensor (`OMNI5C10`); the GZ302 reports `OMNI13B1`. The table adds `OMNI5C10` as a *compatible* ID to the camera, so the stock amdgpu starts the ISP (findings 136) |
 | 0002 | amd_isp4 | ASUS's ACPI table describes no I2C address, lanes or clock for the sensor; this adds them |
-| 0003 | amdgpu | provides the `enable_isp` GPIO the capture driver asks for before it registers (on the GZ302 that line only drives the camera LED, so the driver leaves it alone) |
 | 0004 | ov13b10 | lets the sensor driver bind to the I2C device the board code creates |
-| 0005 | amdgpu | maps the sensor reset line so the sensor powers up before its I2C probe |
 | 0006 | ov13b10 | the PLL and mode registers Windows uses on this laptop (wrong values give a magenta image) |
-| 0007 | amd_isp4_capture | firmware memory pool sized like Windows, MMHUB prefetch, I2C descriptors in the device script, per-frame meta-data buffers, sensor start, data files loaded as firmware |
+| 0007 | amd_isp4_capture | firmware memory pool sized like Windows, MMHUB prefetch, I2C descriptors in the device script, per-frame meta-data buffers, sensor start, data files loaded as firmware, manual focus through the firmware's I2C, module calibration, the `enable_isp` GPIO on the GZ302 |
+| 0008 | amd_isp4 | maps the sensor reset line so the sensor powers up before its I2C probe |
+
+The patches are in [`dkms/patches/`](dkms/patches/); `gz302-camera-dkms` is generated from them and the
+CachyOS kernel sources by [`scripts/make-aur-dkms.sh`](scripts/make-aur-dkms.sh).
 
 Run-time files (in `/usr/lib/firmware/`, installed by `gz302-camera-firmware`):
 
@@ -120,34 +116,20 @@ AMD's and ASUS's files are never distributed here; the firmware package builds t
 files you copy, with [`tools/build_winfw.py`](tools/build_winfw.py) and
 [`tools/assemble_ov13b.py`](tools/assemble_ov13b.py).
 
-## Newer CachyOS release than this repository
-
-The kernel package in [`aur/linux-cachyos-camera/`](aur/linux-cachyos-camera/) is updated here for each
-CachyOS release. If CachyOS is ahead of it:
-
-```sh
-bash scripts/rebuild-camera-kernel.sh
-```
-
-Fetches CachyOS's current PKGBUILD, checks every patch applies without fuzz, builds the same
-`linux-cachyos-camera` (BORE scheduler, GCC without LTO, znver4 tuning) and installs it with
-`pacman -U`; it stops at the first problem. That build does not declare the firmware dependency, so
-install `gz302-camera-firmware` first (step 2 above). [`kernel/hooks/`](kernel/hooks/) has a pacman
-hook that reminds you when CachyOS releases a new kernel.
-
 ## Repository layout
 
 | path | contents |
 |---|---|
-| [`kernel/patches/`](kernel/patches/) | the 7-patch kernel series (the thing to use) |
-| [`aur/`](aur/) | the two AUR packages and their instructions |
-| [`driver/`](driver/) | the capture driver as an out-of-tree module, with its development history as patches 0009-0037 ([`driver/README.md`](driver/README.md)) |
-| [`sensor/`](sensor/) | the ov13b10 sensor driver with the GZ302 quirk, out of tree |
-| [`dkms/`](dkms/) | DKMS package for the capture driver (for kernels that already carry the amdgpu changes) |
+| [`aur/`](aur/) | the two packages (`gz302-camera-dkms`, `gz302-camera-firmware`) and their instructions |
+| [`dkms/patches/`](dkms/patches/) | the patches the DKMS package is built from (0002, 0004, 0006, 0007, 0008) |
+| [`acpi/`](acpi/) | the ACPI table source and its mkinitcpio drop-in (shipped by the DKMS package) |
+| [`driver/`](driver/) | the capture driver as an out-of-tree module, with its development history as patches 0009-0053 ([`driver/README.md`](driver/README.md)) |
 | [`data/`](data/) | the two data files shipped with the firmware package |
-| [`tools/`](tools/) | firmware/script builders, D-PHY and disassembly helpers, Windows trace decoders |
+| [`tools/`](tools/) | firmware/script builders, D-PHY and disassembly helpers, Windows trace decoders, image metrics |
 | [`scripts/`](scripts/) | build, test and release scripts (each one starts with a comment saying what it does) |
 | [`docs/`](docs/) | [`findings.md`](docs/findings.md) (the full bring-up log), [`upstream-plan.md`](docs/upstream-plan.md) |
+
+Earlier versions built a patched kernel (`linux-cachyos-camera`); that route is retired and in the git history.
 
 ## How it was done
 
@@ -159,21 +141,23 @@ or wrong, is in [`docs/findings.md`](docs/findings.md).
 
 ## Upstream
 
-The goal is to need no custom kernel: the amdgpu and amd_isp4 changes (0001-0005) are small and could
-go to CachyOS or mainline, after which a stock kernel plus a DKMS package would be enough. Patch 0007
-needs its debug code removed and splitting into reviewable pieces first. The ISP firmware itself would
+The kernel side needs no custom kernel any more, but it is not upstream: AMD maintains the ISP4 drivers and is
+not adding new platforms until its sensor-agnostic rework; the capture-driver patch 0007 still contains
+experiment code and would need cleaning up and splitting; and the ISP firmware that supports this sensor would
 have to come from AMD through linux-firmware. See [`docs/upstream-plan.md`](docs/upstream-plan.md).
 
 ## Contributing
 
-Reports from other GZ302 owners are welcome, especially whether the `gz302-camera-firmware` build says
-"different version" for your Windows files and whether the camera still works then. Please include
-`uname -r`, the package versions and `journalctl -k -b | grep -i -E "isp|ov13b"`.
+Reports from other GZ302 owners are welcome, especially whether the installer says "different version" for your
+Windows files and whether the camera still works then. Please attach the file from `bash scripts/report.sh --check`.
+For debugging, `sudo modprobe -r amd_isp4_capture && sudo modprobe amd_isp4_capture exp_verbose=1` brings back the
+driver's detailed trace (`EXP-...` lines) in the kernel log.
 
 ## License and disclaimer
 
 GPL-2.0 ([`LICENSE`](LICENSE)), the license of the kernel code the patches change. Not affiliated with
-ASUS, AMD or OmniVision. The files you copy from Windows remain their owners' property. This changes
-your kernel; keep another kernel installed to boot from if something goes wrong.
+ASUS, AMD or OmniVision. The files you copy from Windows remain their owners' property. The DKMS package
+replaces three of your kernel's drivers and adds an ACPI table to your initramfs; `pacman -R gz302-camera-dkms`
+undoes both.
 
-Built on CachyOS's kernel PKGBUILDs and the upstream AMD ISP4 drivers.
+Built on the upstream AMD ISP4 drivers and CachyOS's kernel sources.

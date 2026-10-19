@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Copy the two AUR packages from aur/ into local clones of their AUR git repositories, ready for you
+# Copy the two AUR packages (gz302-camera-firmware, gz302-camera-dkms) from aur/ into local clones of their AUR
+# git repositories, ready for you
 # to commit and push. Pushes nothing itself.
 #
 #   ./scripts/aur-sync.sh
@@ -16,7 +17,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 grep -q "^b2sums=('SKIP')" "$project_dir/aur/gz302-camera-firmware/PKGBUILD" \
 	&& die "firmware b2sums is still SKIP: push the tag, then run scripts/aur-firmware-checksum.sh"
 
-for pkg in gz302-camera-firmware linux-cachyos-camera; do
+for pkg in gz302-camera-firmware gz302-camera-dkms; do
 	src="$project_dir/aur/$pkg"
 	dst="$project_dir/aur-git/$pkg"
 
@@ -28,24 +29,26 @@ for pkg in gz302-camera-firmware linux-cachyos-camera; do
 
 	[[ -d $dst/.git ]] || git clone "ssh://aur@aur.archlinux.org/$pkg.git" "$dst"
 
-	# Only the files the package needs: PKGBUILD, .SRCINFO and its local sources.
+	# Only the files the package needs: PKGBUILD, .SRCINFO and its local sources. The DKMS package's sources
+	# (driver files, Kbuild, dkms.conf, ACPI table, drop-in, .install) all live next to its PKGBUILD. A file
+	# dropped from the package is NOT removed from the clone; git status below shows it.
 	cp "$src/PKGBUILD" "$src/.SRCINFO" "$dst/"
-	if [[ $pkg == linux-cachyos-camera ]]; then
-		cp "$src/config" "$src"/*.patch "$dst/"
+	if [[ $pkg == gz302-camera-dkms ]]; then
+		cp "$src"/* "$dst/"
 	fi
 	echo "=== $pkg ($dst)"
 	git -C "$dst" status --short
 done
 
 ver_fw=$(sed -n 's/^pkgver=//p' "$project_dir/aur/gz302-camera-firmware/PKGBUILD")
-ver_k=$(sed -n 's/^_major=//p;s/^_minor=//p' "$project_dir/aur/linux-cachyos-camera/PKGBUILD" | paste -sd.)
+ver_dk=$(sed -n 's/^pkgver=//p' "$project_dir/aur/gz302-camera-dkms/PKGBUILD")
 cat <<EOF
 
 Review the changes above, then publish each package yourself:
   git -C aur-git/gz302-camera-firmware add -A
   git -C aur-git/gz302-camera-firmware commit -m "gz302-camera-firmware $ver_fw"
   git -C aur-git/gz302-camera-firmware push origin master
-  git -C aur-git/linux-cachyos-camera add -A
-  git -C aur-git/linux-cachyos-camera commit -m "linux-cachyos-camera $ver_k"
-  git -C aur-git/linux-cachyos-camera push origin master
+  git -C aur-git/gz302-camera-dkms add -A
+  git -C aur-git/gz302-camera-dkms commit -m "gz302-camera-dkms $ver_dk"
+  git -C aur-git/gz302-camera-dkms push origin master
 EOF
