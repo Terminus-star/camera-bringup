@@ -27,7 +27,7 @@ license=('GPL-2.0-only')	# the build tools and shipped data; the files you copy 
 makedepends=('python' 'zstd' 'linux-firmware-amdgpu')
 options=('!debug' '!strip')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-b2sums=('450a5ca78d07a8a6607332cad5daa3375d98943c5473d1ee8eadac611f248a3e969d2974eec4069a4d4a320d63a8b81a0ff7562ab1eb2e1681e122346532fa47')
+b2sums=('d211702fad49c96ccd5df24d9d2729296585db1a482baffd48051e71637b67e5b46cd33a1315e546e46c8b104088729d919d8cc89fe9ee8d355c04a9a7a545be')
 
 _userdir=cam-firm-gz302ea
 # The files this was tested with (driver on the GZ302EA in 2026-10). Other versions only give a warning.
